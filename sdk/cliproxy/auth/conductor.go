@@ -2398,6 +2398,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
+	// Account grouping: narrow selection to the bound group's credentials by
+	// pre-marking out-of-group auths as tried, and prepare any fallback groups.
+	grp := m.groupFromMetadata(opts.Metadata)
+	var fallbackGroups []*internalconfig.GroupConfig
+	if groupCredentialNarrowing(grp) {
+		m.seedOutOfGroupTried(grp, tried)
+		fallbackGroups = m.resolveFallbackGroups(grp)
+	}
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -2411,6 +2419,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
+			if len(fallbackGroups) > 0 {
+				next := fallbackGroups[0]
+				fallbackGroups = fallbackGroups[1:]
+				m.admitGroupAuths(next, tried)
+				continue
+			}
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -2500,6 +2514,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
+	// Account grouping: narrow selection to the bound group's credentials by
+	// pre-marking out-of-group auths as tried, and prepare any fallback groups.
+	grp := m.groupFromMetadata(opts.Metadata)
+	var fallbackGroups []*internalconfig.GroupConfig
+	if groupCredentialNarrowing(grp) {
+		m.seedOutOfGroupTried(grp, tried)
+		fallbackGroups = m.resolveFallbackGroups(grp)
+	}
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -2513,6 +2535,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
+			if len(fallbackGroups) > 0 {
+				next := fallbackGroups[0]
+				fallbackGroups = fallbackGroups[1:]
+				m.admitGroupAuths(next, tried)
+				continue
+			}
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -2602,6 +2630,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
+	// Account grouping: narrow selection to the bound group's credentials by
+	// pre-marking out-of-group auths as tried, and prepare any fallback groups.
+	grp := m.groupFromMetadata(opts.Metadata)
+	var fallbackGroups []*internalconfig.GroupConfig
+	if groupCredentialNarrowing(grp) {
+		m.seedOutOfGroupTried(grp, tried)
+		fallbackGroups = m.resolveFallbackGroups(grp)
+	}
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -2615,6 +2651,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
+			if len(fallbackGroups) > 0 {
+				next := fallbackGroups[0]
+				fallbackGroups = fallbackGroups[1:]
+				m.admitGroupAuths(next, tried)
+				continue
+			}
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return nil, lastErr
 			}

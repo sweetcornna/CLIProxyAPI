@@ -784,6 +784,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
+	// Normalize the claude→upstream model mapping table (longest-wins precompute).
+	cfg.SanitizeModelMapping()
+
+	// Normalize lightweight account groups (dedupe keys, sort per-group mapping).
+	cfg.SanitizeGroups()
+
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 

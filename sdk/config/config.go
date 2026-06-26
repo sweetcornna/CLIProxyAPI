@@ -28,10 +28,24 @@ type OpenAICompatibility = internalconfig.OpenAICompatibility
 type OpenAICompatibilityAPIKey = internalconfig.OpenAICompatibilityAPIKey
 type OpenAICompatibilityModel = internalconfig.OpenAICompatibilityModel
 
+type ModelMappingConfig = internalconfig.ModelMappingConfig
+type ModelMappingRule = internalconfig.ModelMappingRule
+type GroupConfig = internalconfig.GroupConfig
+type RoutingConfig = internalconfig.RoutingConfig
+type CompatConfig = internalconfig.CompatConfig
+
 type TLS = internalconfig.TLSConfig
 
 const (
 	DefaultPanelGitHubRepository = internalconfig.DefaultPanelGitHubRepository
+)
+
+// Re-exported model-mapping / grouping helpers.
+var (
+	ResolveMappedModel       = internalconfig.ResolveMappedModel
+	GroupForAPIKey           = internalconfig.GroupForAPIKey
+	GroupByName              = internalconfig.GroupByName
+	DefaultModelMappingRules = internalconfig.DefaultModelMappingRules
 )
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }

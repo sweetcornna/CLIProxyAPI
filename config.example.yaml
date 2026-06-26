@@ -170,6 +170,63 @@ routing:
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
 
+# ── Claude Code ↔ GPT compatibility (fork additions) ──────────────────────────
+#
+# model-mapping rewrites an incoming (Claude) model name to an upstream model id
+# BEFORE provider resolution, so Claude Code clients using native claude-* names
+# are served by a GPT/Codex backend. Exact patterns beat wildcards; among
+# wildcards the longest pattern wins. Inert unless configured (so deployments that
+# also serve real Claude are never hijacked — scope per-group below if you do).
+#
+# IMPORTANT (auto-compact): keep native claude-* names on the client. Claude Code
+# uses its built-in window for the requested name, so auto-compact fires correctly
+# as long as the advertised/real upstream window is >= that. Codex windows today:
+# gpt-5.5 ≈ 400K (1M is API-only; Codex 1M for 5.5 is openai/codex#19464),
+# gpt-5.4 ≈ 1.05M (the only genuine 1M lane on a ChatGPT subscription),
+# gpt-5.4-mini ≈ 400K. Do NOT advertise a window larger than the upstream allows.
+# model-mapping:
+#   enabled: true
+#   rules:
+#     - { pattern: "claude-opus-*",   target: "gpt-5.5" }       # latest; real 400K
+#     - { pattern: "claude-sonnet-*", target: "gpt-5.5" }       # latest; real 400K
+#     - { pattern: "claude-haiku-*",  target: "gpt-5.4-mini" }  # small/fast; 400K
+#     # On-demand genuine 1M lane (Codex): point opus at gpt-5.4, or use a group.
+#     # - { pattern: "claude-opus-*", target: "gpt-5.4" }       # real ~1M
+
+# model-context-overrides advertises an explicit context window (tokens) for an
+# upstream model id in /v1/models, overriding the catalog value. Escape hatch to
+# keep auto-compact math honest. A per-rule "context-length" does the same per map.
+# model-context-overrides:
+#   gpt-5.5: 400000
+#   gpt-5.4: 1050000
+
+# groups bind inbound api-keys to a credential selection + per-group model-mapping
+# override + optional fallback group. Config-only (no DB / UI / billing / quotas).
+# Use groups to give different keys different mappings, e.g. a long-context lane.
+# groups:
+#   - name: "default"
+#     api-keys: ["REPLACE_WITH_SK_KEY_cornna"]
+#     providers: ["codex"]
+#     routing: { strategy: "round-robin" }   # inherits global model-mapping
+#   - name: "longctx"
+#     api-keys: ["REPLACE_WITH_SK_KEY_1m"]
+#     providers: ["codex"]
+#     model-mapping:
+#       rules:
+#         - { pattern: "claude-*", target: "gpt-5.4" }  # genuine 1M on Codex
+#     fallback-group: "default"
+
+# claude-compat injects a minimal, scoped sub-agent dispatch nudge (as a
+# <system-reminder> in the first user message) ONLY when a Claude Code request is
+# mapped to a non-Claude upstream AND exposes a Task/Agent tool. It curbs runaway
+# binary-tree sub-agent proliferation while preserving legitimate parallel fan-out,
+# and never touches real (unmapped) Claude requests. Enabled by default.
+# claude-compat:
+#   enabled: true
+#   subagent-nudge: true
+#   # subagent-nudge-text: "...custom override..."
+# ──────────────────────────────────────────────────────────────────────────────
+
 # Codex provider behavior.
 codex:
   # When true, and routing.strategy is fill-first or routing.session-affinity is true,

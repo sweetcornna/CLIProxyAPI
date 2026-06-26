@@ -55,6 +55,26 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+
+	// ModelMapping is the global request-time claude→upstream model rewrite table.
+	// It is consulted by the API handlers before provider resolution. Inert unless
+	// configured. See model_mapping.go and config.example.yaml.
+	ModelMapping ModelMappingConfig `yaml:"model-mapping,omitempty" json:"model-mapping,omitempty"`
+
+	// Groups defines lightweight, config-only account groups that bind inbound API
+	// keys to a credential selection, a per-group model-mapping override, a routing
+	// strategy, and an optional fallback group. Empty by default.
+	Groups []GroupConfig `yaml:"groups,omitempty" json:"groups,omitempty"`
+
+	// ModelContextOverrides advertises an explicit context window (in tokens) for an
+	// upstream model id, overriding the registry/catalog value. Escape hatch for
+	// keeping Claude Code auto-compact math honest. See Feature 2.
+	ModelContextOverrides map[string]int `yaml:"model-context-overrides,omitempty" json:"model-context-overrides,omitempty"`
+
+	// ClaudeCompat configures Claude Code compatibility prompt injection (e.g. the
+	// sub-agent dispatch nudge). Enabled by default; only fires for Claude Code
+	// requests mapped to a non-Claude upstream that expose a dispatch tool.
+	ClaudeCompat CompatConfig `yaml:"claude-compat,omitempty" json:"claude-compat,omitempty"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.

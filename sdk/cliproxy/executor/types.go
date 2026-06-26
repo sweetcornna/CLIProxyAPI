@@ -24,6 +24,10 @@ const ReasoningEffortMetadataKey = "reasoning_effort"
 // ServiceTierMetadataKey stores the client-requested service tier for usage logs.
 const ServiceTierMetadataKey = "service_tier"
 
+// GroupNameMetadataKey stores the account group bound to the inbound API key,
+// used to narrow upstream credential selection and apply a fallback group.
+const GroupNameMetadataKey = "group_name"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"

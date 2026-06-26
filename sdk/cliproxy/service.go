@@ -1110,6 +1110,10 @@ func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey st
 		GlobalModelRegistry().UnregisterClient(a.ID)
 		return
 	}
+	var ctxOverrides map[string]int
+	if s.cfg != nil {
+		ctxOverrides = s.cfg.EffectiveModelContextOverrides()
+	}
 	normalizedModels := make([]*ModelInfo, 0, len(models))
 	for _, model := range models {
 		if model == nil {
@@ -1121,6 +1125,19 @@ func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey st
 		}
 		clone := *model
 		clone.ID = modelID
+		// Apply configured context-window overrides so /v1/models advertises an
+		// honest window (keeps Claude Code auto-compact math correct). Warn when an
+		// override exceeds the upstream catalog window — that risks overruns.
+		if win, ok := ctxOverrides[modelID]; ok && win > 0 {
+			if model.ContextLength > 0 && win > model.ContextLength {
+				log.WithFields(log.Fields{
+					"model":    modelID,
+					"override": win,
+					"upstream": model.ContextLength,
+				}).Warn("model-context-override exceeds upstream catalog window; requests past the upstream limit may fail")
+			}
+			clone.ContextLength = win
+		}
 		normalizedModels = append(normalizedModels, &clone)
 	}
 	if len(normalizedModels) == 0 {
