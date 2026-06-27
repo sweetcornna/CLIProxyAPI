@@ -6,6 +6,7 @@ package usagestats
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
@@ -109,6 +110,34 @@ func latencyBin(ms int64) int {
 		}
 	}
 	return latencyBinCount - 1
+}
+
+// percentileFromHist returns an approximate percentile (ms) using bin upper
+// bounds: the upper bound of the bin holding the q-th sample. The last (+inf)
+// bin returns the largest finite bound. Returns 0 when empty.
+func percentileFromHist(hist [latencyBinCount]int64, q float64) int64 {
+	var total int64
+	for _, c := range hist {
+		total += c
+	}
+	if total == 0 {
+		return 0
+	}
+	target := int64(math.Ceil(float64(total) * q))
+	if target < 1 {
+		target = 1
+	}
+	var cum int64
+	for i, c := range hist {
+		cum += c
+		if cum >= target {
+			if i >= len(latencyBinsMs) {
+				return latencyBinsMs[len(latencyBinsMs)-1]
+			}
+			return latencyBinsMs[i]
+		}
+	}
+	return latencyBinsMs[len(latencyBinsMs)-1]
 }
 
 func dimAdd(m map[string]*bucketAgg, key string, r coreusage.Record) {

@@ -25,3 +25,21 @@ func TestHandleUsageCounts(t *testing.T) {
 		t.Fatalf("requests = %d, want 2", got)
 	}
 }
+
+func TestPercentileFromHist(t *testing.T) {
+	var h [latencyBinCount]int64
+	for i := 0; i < 9; i++ {
+		h[0]++ // 9 samples in bin 0 (<=50ms)
+	}
+	h[4]++ // 1 sample in bin 4 (<=800ms)
+	if p := percentileFromHist(h, 0.95); p != 800 {
+		t.Fatalf("p95 = %d, want 800 (upper bound of bin 4)", p)
+	}
+	if p := percentileFromHist(h, 0.50); p != 50 {
+		t.Fatalf("p50 = %d, want 50", p)
+	}
+	var empty [latencyBinCount]int64
+	if p := percentileFromHist(empty, 0.95); p != 0 {
+		t.Fatalf("empty p95 = %d, want 0", p)
+	}
+}
