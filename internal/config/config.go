@@ -77,6 +77,9 @@ type Config struct {
 	// Default: 60. Max: 3600.
 	RedisUsageQueueRetentionSeconds int `yaml:"redis-usage-queue-retention-seconds" json:"redis-usage-queue-retention-seconds"`
 
+	// UsageStats controls the in-process usage stats aggregator (token/latency).
+	UsageStats UsageStatsConfig `yaml:"usage-stats" json:"usage-stats"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -1891,4 +1894,33 @@ func removeLegacyAuthBlock(root *yaml.Node) {
 		return
 	}
 	removeMapKey(root, "auth")
+}
+
+// UsageStatsConfig controls the in-process usage stats aggregator (Phase 2).
+type UsageStatsConfig struct {
+	// Enabled toggles the aggregator. nil => default enabled.
+	Enabled *bool `yaml:"enabled" json:"enabled"`
+	// RetentionHours of in-memory aggregates (default 48).
+	RetentionHours int `yaml:"retention-hours" json:"retention-hours"`
+	// SnapshotIntervalSeconds for periodic JSON snapshots (default 300, 0 disables).
+	SnapshotIntervalSeconds int `yaml:"snapshot-interval-seconds" json:"snapshot-interval-seconds"`
+}
+
+// IsEnabled reports whether the aggregator should run (default-on).
+func (u UsageStatsConfig) IsEnabled() bool { return u.Enabled == nil || *u.Enabled }
+
+// Retention returns the in-memory retention in hours (default 48).
+func (u UsageStatsConfig) Retention() int {
+	if u.RetentionHours > 0 {
+		return u.RetentionHours
+	}
+	return 48
+}
+
+// SnapshotInterval returns the snapshot interval in seconds (default 300; <0 keeps as set).
+func (u UsageStatsConfig) SnapshotInterval() int {
+	if u.SnapshotIntervalSeconds != 0 {
+		return u.SnapshotIntervalSeconds
+	}
+	return 300
 }
