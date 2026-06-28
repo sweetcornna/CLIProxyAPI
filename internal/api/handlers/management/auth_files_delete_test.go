@@ -170,3 +170,59 @@ func TestDeleteAuthFile_RemovesRuntimeAuth(t *testing.T) {
 		t.Fatalf("expected runtime auth %q to be removed", record.ID)
 	}
 }
+
+func TestDeleteAuthFile_RemovesGroupCredentialBindingWithoutWideningProvider(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	fileName := "delete-bound-codex.json"
+	filePath := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex","email":"bound@example.com"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "bound@example.com",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandler(&config.Config{
+		AuthDir: authDir,
+		SDKConfig: config.SDKConfig{
+			Groups: []config.GroupConfig{
+				{Name: "team", APIKeys: []string{"sk-team"}, Providers: []string{"codex"}, Credentials: []string{fileName}},
+			},
+		},
+	}, writeTestConfigFile(t), manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	deleteRec := httptest.NewRecorder()
+	deleteCtx, _ := gin.CreateTestContext(deleteRec)
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(fileName), nil)
+	deleteCtx.Request = deleteReq
+	h.DeleteAuthFile(deleteCtx)
+
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, deleteRec.Code, deleteRec.Body.String())
+	}
+	group := h.cfg.Groups[0]
+	if stringSliceContains(group.Credentials, fileName) {
+		t.Fatalf("deleted auth credential remained in group: %#v", group.Credentials)
+	}
+	if !group.DenyCredentials {
+		t.Fatalf("group should deny credentials after deleting its last explicit credential, got %+v", group)
+	}
+}

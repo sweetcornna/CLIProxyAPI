@@ -874,6 +874,10 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 				}
 				deleted++
 				h.removeAuth(ctx, full)
+				if errCleanup := h.removeAuthFileGroupBindings(ctx, name, full, h.authIDForPath(full)); errCleanup != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": errCleanup.Error()})
+					return
+				}
 			}
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
@@ -1106,6 +1110,9 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
 	}
 	h.removeAuthsForPath(ctx, targetPath, targetID)
+	if errCleanup := h.removeAuthFileGroupBindings(ctx, name, filepath.Base(targetPath), targetPath, h.authIDForPath(targetPath), targetID); errCleanup != nil {
+		return filepath.Base(name), http.StatusInternalServerError, errCleanup
+	}
 	return filepath.Base(name), http.StatusOK, nil
 }
 

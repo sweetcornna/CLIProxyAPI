@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -166,6 +167,61 @@ func (h *Handler) saveAuthFileGroupConfig(ctx context.Context, nextCfg *config.C
 	h.mu.Unlock()
 	h.reloadConfigAfterManagementSave(ctx, snapshot)
 	return nil
+}
+
+func (h *Handler) removeAuthFileGroupBindings(ctx context.Context, refs ...string) error {
+	if h == nil || h.cfg == nil || len(h.cfg.Groups) == 0 {
+		return nil
+	}
+	refSet := make(map[string]struct{}, len(refs)*2)
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		refSet[ref] = struct{}{}
+		if base := filepath.Base(ref); base != "." && base != "/" && base != ref {
+			refSet[base] = struct{}{}
+		}
+	}
+	if len(refSet) == 0 {
+		return nil
+	}
+
+	nextCfg := h.cfg.CloneForRuntime()
+	if nextCfg == nil {
+		return nil
+	}
+	changed := false
+	for i := range nextCfg.Groups {
+		group := &nextCfg.Groups[i]
+		if len(group.Credentials) == 0 {
+			continue
+		}
+		credentials := make([]string, 0, len(group.Credentials))
+		removed := false
+		for _, credential := range group.Credentials {
+			trimmed := strings.TrimSpace(credential)
+			if _, ok := refSet[trimmed]; ok {
+				removed = true
+				continue
+			}
+			credentials = append(credentials, credential)
+		}
+		if !removed {
+			continue
+		}
+		group.Credentials = credentials
+		if len(credentials) == 0 {
+			group.DenyCredentials = true
+		}
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	nextCfg.SanitizeGroups()
+	return h.saveAuthFileGroupConfig(ctx, nextCfg)
 }
 
 func (h *Handler) rollbackAuthFileWrite(ctx context.Context, path string, hadOldFile bool, oldData []byte, oldAuth *coreauth.Auth, newAuthID string) {
