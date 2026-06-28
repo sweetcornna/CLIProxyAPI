@@ -191,6 +191,34 @@ func TestHandlerModelRouterRoutesBeforeRequestDetails(t *testing.T) {
 	}
 }
 
+func TestHandlerModelRouterReceivesBoundGroupMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	model := "handler-router-group-model"
+	host := &handlerModelRouterTestHost{hasRouters: true}
+	var gotGroup any
+	host.route = func(ctx context.Context, req pluginapi.ModelRouteRequest, skipPluginID string) (pluginapi.ModelRouteResponse, bool) {
+		gotGroup = req.Metadata[coreexecutor.GroupNameMetadataKey]
+		return pluginapi.ModelRouteResponse{}, false
+	}
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		APIKeys: []string{"sk-team"},
+		Groups: []sdkconfig.GroupConfig{
+			{Name: "team", APIKeys: []string{"sk-team"}},
+		},
+	}, nil)
+	handler.SetModelRouterHost(host)
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Set("userApiKey", "sk-team")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	handler.applyModelRouter(ctx, "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), false, modelExecutionOptions{})
+	if gotGroup != "team" {
+		t.Fatalf("router group metadata = %#v, want %q", gotGroup, "team")
+	}
+}
+
 func TestHandlerModelRouterDirectExecutorRunsAfterAuthInterceptor(t *testing.T) {
 	originalModel := "handler-router-after-auth-original-model"
 	targetPluginID := "websearch-plugin"

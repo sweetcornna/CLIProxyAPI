@@ -258,6 +258,48 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledAcrossPriorities(t *
 	}
 }
 
+func TestSchedulerPick_CompactSkipsExplicitlyUnsupportedAuth(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-unsupported", Provider: "codex", Attributes: map[string]string{"priority": "10", "openai_compact_supported": "false"}},
+		&Auth{ID: "codex-unknown", Provider: "codex", Attributes: map[string]string{"priority": "0"}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{Alt: "responses/compact"}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "codex-unknown" {
+		t.Fatalf("pickSingle() auth.ID = %q, want codex-unknown", got.ID)
+	}
+}
+
+func TestSchedulerPick_CompactPrefersSupportedOverUnknownAcrossPriorities(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "codex-unknown", Provider: "codex", Attributes: map[string]string{"priority": "10"}},
+		&Auth{ID: "codex-supported", Provider: "codex", Attributes: map[string]string{"priority": "0", "compact_supported": "true"}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{Alt: "responses/compact"}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "codex-supported" {
+		t.Fatalf("pickSingle() auth.ID = %q, want codex-supported", got.ID)
+	}
+}
+
 func TestSchedulerPick_MixedProvidersUsesWeightedProviderRotationOverReadyCandidates(t *testing.T) {
 	t.Parallel()
 

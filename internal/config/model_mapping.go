@@ -8,6 +8,7 @@
 package config
 
 import (
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -128,12 +129,27 @@ type GroupConfig struct {
 	// Credentials optionally restricts the group to auths whose label/id matches
 	// one of these glob patterns (e.g. "codex-pro-*").
 	Credentials []string `yaml:"credentials,omitempty" json:"credentials,omitempty"`
+	// DenyCredentials makes the group match no upstream credentials. This is
+	// useful for preserving an inbound api-key group while its allowed credential
+	// set is intentionally empty; a group with no providers/credentials still
+	// means "no credential narrowing" for backward compatibility.
+	DenyCredentials bool `yaml:"deny-credentials,omitempty" json:"deny-credentials,omitempty"`
+	// Models optionally restricts the group to requested model ids or glob
+	// patterns (filepath.Match syntax). A group with no models keeps legacy
+	// "all models" behavior unless DenyModels is true.
+	Models []string `yaml:"models,omitempty" json:"models,omitempty"`
+	// DenyModels makes the group match no requested models. This preserves an
+	// inbound api-key group while its per-model allowed set is intentionally empty.
+	DenyModels bool `yaml:"deny-models,omitempty" json:"deny-models,omitempty"`
 	// Routing selects the per-group credential strategy (round-robin/fill-first).
 	Routing RoutingConfig `yaml:"routing,omitempty" json:"routing,omitempty"`
 	// ModelMapping overrides/extends the global mapping for this group.
 	ModelMapping ModelMappingConfig `yaml:"model-mapping,omitempty" json:"model-mapping,omitempty"`
 	// FallbackGroup is attempted (once per hop) when this group's credentials are exhausted.
 	FallbackGroup string `yaml:"fallback-group,omitempty" json:"fallback-group,omitempty"`
+	// FallbackGroupOnInvalidRequest is attempted once when this group's selected
+	// credential returns a request-shape invalid_request error.
+	FallbackGroupOnInvalidRequest string `yaml:"fallback-group-on-invalid-request,omitempty" json:"fallback-group-on-invalid-request,omitempty"`
 }
 
 // DefaultModelMappingRules returns the shipped default claude→GPT rules.
@@ -199,12 +215,28 @@ func (cfg *Config) SanitizeGroups() {
 				creds = append(creds, c)
 			}
 		}
+		models := make([]string, 0, len(g.Models))
+		seenModels := make(map[string]struct{}, len(g.Models))
+		for _, m := range g.Models {
+			m = strings.TrimSpace(m)
+			if m == "" {
+				continue
+			}
+			key := strings.ToLower(m)
+			if _, dup := seenModels[key]; dup {
+				continue
+			}
+			seenModels[key] = struct{}{}
+			models = append(models, m)
+		}
 		g.Name = name
 		g.APIKeys = keys
 		g.Providers = providers
 		g.Credentials = creds
+		g.Models = models
 		g.ModelMapping.Rules = sanitizeRules(g.ModelMapping.Rules)
 		g.FallbackGroup = strings.TrimSpace(g.FallbackGroup)
+		g.FallbackGroupOnInvalidRequest = strings.TrimSpace(g.FallbackGroupOnInvalidRequest)
 		clean = append(clean, g)
 	}
 	cfg.Groups = clean
@@ -224,6 +256,48 @@ func GroupForAPIKey(groups []GroupConfig, apiKey string) *GroupConfig {
 		}
 	}
 	return nil
+}
+
+// GroupHasModelScope reports whether grp restricts requested model names.
+func GroupHasModelScope(grp *GroupConfig) bool {
+	return grp != nil && (grp.DenyModels || len(grp.Models) > 0)
+}
+
+// GroupAllowsModel reports whether grp permits any of the supplied model names.
+// Groups without a model scope keep legacy "all models" behavior. Matching is
+// case-insensitive and accepts exact ids or filepath.Match-style globs.
+func GroupAllowsModel(grp *GroupConfig, modelNames ...string) bool {
+	if grp == nil || !GroupHasModelScope(grp) {
+		return true
+	}
+	if grp.DenyModels {
+		return false
+	}
+	for _, rawName := range modelNames {
+		name := normalizeGroupModelCandidate(rawName)
+		if name == "" {
+			continue
+		}
+		for _, rawPattern := range grp.Models {
+			pattern := normalizeGroupModelCandidate(rawPattern)
+			if pattern == "" {
+				continue
+			}
+			if pattern == name {
+				return true
+			}
+			if ok, _ := filepath.Match(pattern, name); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizeGroupModelCandidate(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "models/")
+	return strings.ToLower(value)
 }
 
 // EffectiveModelContextOverrides merges explicit ModelContextOverrides with any

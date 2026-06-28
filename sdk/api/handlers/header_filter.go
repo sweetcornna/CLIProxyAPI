@@ -17,6 +17,11 @@ var gatewayHeaderPrefixes = []string{
 	"x-bt-",
 }
 
+const (
+	requestIDHeader         = "X-Request-Id"
+	upstreamRequestIDHeader = "X-Upstream-Request-Id"
+)
+
 // hopByHopHeaders lists RFC 7230 Section 6.1 hop-by-hop headers that MUST NOT
 // be forwarded by proxies, plus security-sensitive headers that should not leak.
 var hopByHopHeaders = map[string]struct{}{
@@ -94,6 +99,9 @@ func WriteUpstreamHeaders(dst http.Header, src http.Header) {
 		return
 	}
 	for key, values := range src {
+		if writeUpstreamRequestIDHeader(dst, key, values) {
+			continue
+		}
 		// Don't overwrite headers already set by CPA handlers
 		if dst.Get(key) != "" {
 			continue
@@ -102,4 +110,16 @@ func WriteUpstreamHeaders(dst http.Header, src http.Header) {
 			dst.Add(key, v)
 		}
 	}
+}
+
+func writeUpstreamRequestIDHeader(dst http.Header, key string, values []string) bool {
+	if dst == nil || http.CanonicalHeaderKey(key) != requestIDHeader || dst.Get(requestIDHeader) == "" {
+		return false
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			dst.Add(upstreamRequestIDHeader, value)
+		}
+	}
+	return true
 }

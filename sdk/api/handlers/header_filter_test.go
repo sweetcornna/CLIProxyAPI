@@ -53,3 +53,19 @@ func TestFilterUpstreamHeaders_ReturnsNilWhenAllHeadersBlocked(t *testing.T) {
 		t.Fatalf("expected nil when all headers are filtered, got %#v", filtered)
 	}
 }
+
+func TestWriteUpstreamHeadersKeepsLocalRequestIDAndCopiesUpstreamRequestID(t *testing.T) {
+	dst := http.Header{}
+	dst.Set("X-Request-Id", "local-req")
+	src := http.Header{}
+	src.Set("X-Request-Id", "upstream-req")
+
+	WriteUpstreamHeaders(dst, src)
+
+	if got := dst.Get("X-Request-Id"); got != "local-req" {
+		t.Fatalf("X-Request-Id = %q, want local request id", got)
+	}
+	if got := dst.Get("X-Upstream-Request-Id"); got != "upstream-req" {
+		t.Fatalf("X-Upstream-Request-Id = %q, want upstream request id", got)
+	}
+}

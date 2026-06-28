@@ -74,6 +74,38 @@ func TestFindAllAntigravityCreditsCandidateAuths_PrefersKnownCreditsThenUnknown(
 	}
 }
 
+func TestFindAllAntigravityCreditsCandidateAuths_RespectsGroupCredentialScope(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			Groups: []internalconfig.GroupConfig{
+				{Name: "team", Providers: []string{"antigravity"}, Credentials: []string{"ag-team"}},
+			},
+		},
+	})
+	m.executors["antigravity"] = schedulerTestExecutor{}
+	if _, errRegister := m.Register(context.Background(), &Auth{ID: "ag-team", Provider: "antigravity"}); errRegister != nil {
+		t.Fatalf("register ag-team: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), &Auth{ID: "ag-outside", Provider: "antigravity"}); errRegister != nil {
+		t.Fatalf("register ag-outside: %v", errRegister)
+	}
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.GroupNameMetadataKey: "team"},
+	}
+	candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(context.Background(), "claude-sonnet-4-6", opts)
+	if errCandidates != nil {
+		t.Fatalf("findAllAntigravityCreditsCandidateAuths() error = %v", errCandidates)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates len = %d, want 1: %#v", len(candidates), candidates)
+	}
+	if candidates[0].auth.ID != "ag-team" {
+		t.Fatalf("candidate auth.ID = %q, want ag-team", candidates[0].auth.ID)
+	}
+}
+
 func TestFindAllAntigravityCreditsCandidateAuths_HomeKVUnavailableReturnsError(t *testing.T) {
 	homekv.SetCurrent(homekv.New(internalconfig.HomeConfig{Enabled: false}))
 	t.Cleanup(homekv.ClearCurrent)

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,6 +92,389 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for upstream websocket payload")
+	}
+}
+
+func TestCodexWebsocketsExecuteClaudeAPIKeyTrimsFullReplayAndAddsTodoGuard(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayload := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade websocket: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		msgType, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read upstream websocket message: %v", err)
+		}
+		if msgType != websocket.TextMessage {
+			t.Fatalf("message type = %d, want text", msgType)
+		}
+		capturedPayload <- bytes.Clone(payload)
+
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-ws-2","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Fatalf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	var messages strings.Builder
+	messages.WriteByte('[')
+	for i := 0; i < 15; i++ {
+		if i > 0 {
+			messages.WriteByte(',')
+		}
+		messages.WriteString(`{"role":"user","content":[{"type":"text","text":"message-`)
+		if i < 10 {
+			messages.WriteByte('0')
+		}
+		messages.WriteString(strconv.Itoa(i))
+		messages.WriteString(`"}]}`)
+	}
+	messages.WriteByte(']')
+	claudePayload := []byte(`{
+		"model":"gpt-5.4",
+		"metadata":{"user_id":"{\"device_id\":\"device-a\",\"account_uuid\":\"\",\"session_id\":\"ws-full-replay-guard-session\"}"},
+		"messages":` + messages.String() + `
+	}`)
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-ws-full-replay-guard",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: claudePayload,
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}
+
+	if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	select {
+	case payload := <-capturedPayload:
+		input := gjson.GetBytes(payload, "input").Array()
+		if got := len(input); got != 13 {
+			t.Fatalf("input length = %d, want 13 (developer guard + 12 tail messages); payload=%s", got, payload)
+		}
+		if got := gjson.GetBytes(payload, "input.0.role").String(); got != "developer" {
+			t.Fatalf("input.0.role = %q, want developer; payload=%s", got, payload)
+		}
+		if got := gjson.GetBytes(payload, "input.0.content.0.text").String(); !strings.Contains(got, openAICompatClaudeCodeTodoGuardMarker) {
+			t.Fatalf("developer guard missing marker; text=%q payload=%s", got, payload)
+		}
+		if got := gjson.GetBytes(payload, "input.1.content.0.text").String(); got != "message-03" {
+			t.Fatalf("first retained message = %q, want message-03; payload=%s", got, payload)
+		}
+		if got := gjson.GetBytes(payload, "input.12.content.0.text").String(); got != "message-14" {
+			t.Fatalf("last retained message = %q, want message-14; payload=%s", got, payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream websocket payload")
+	}
+}
+
+func TestCodexWebsocketsExecuteAttachesPreviousResponseIDForAPIKeyClaudeCodeSession(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayloads := make(chan []byte, 2)
+	var mu sync.Mutex
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade websocket: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		msgType, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read upstream websocket message: %v", err)
+		}
+		if msgType != websocket.TextMessage {
+			t.Fatalf("message type = %d, want text", msgType)
+		}
+
+		mu.Lock()
+		requestCount++
+		idx := requestCount
+		mu.Unlock()
+		capturedPayloads <- bytes.Clone(payload)
+
+		responseID := "resp_ws_first"
+		if idx > 1 {
+			responseID = "resp_ws_second"
+		}
+		completed := []byte(`{"type":"response.completed","response":{"id":"` + responseID + `","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Fatalf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-ws-previous-response",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+	firstReq := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"metadata":{"user_id":"{\"device_id\":\"device-a\",\"account_uuid\":\"\",\"session_id\":\"ws-previous-response-session\"}"},
+			"messages":[{"role":"user","content":[{"type":"text","text":"first"}]}]
+		}`),
+	}
+	secondReq := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"metadata":{"user_id":"{\"device_id\":\"device-b\",\"account_uuid\":\"\",\"session_id\":\"ws-previous-response-session\"}"},
+			"messages":[{"role":"user","content":[{"type":"text","text":"second"}]}]
+		}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}
+
+	if _, err := exec.Execute(context.Background(), auth, firstReq, opts); err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+	if _, err := exec.Execute(context.Background(), auth, secondReq, opts); err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+
+	firstPayload := <-capturedPayloads
+	secondPayload := <-capturedPayloads
+	if got := gjson.GetBytes(firstPayload, "previous_response_id").String(); got != "" {
+		t.Fatalf("first previous_response_id = %q, want empty; payload=%s", got, firstPayload)
+	}
+	if got := gjson.GetBytes(secondPayload, "previous_response_id").String(); got != "resp_ws_first" {
+		t.Fatalf("second previous_response_id = %q, want resp_ws_first; payload=%s", got, secondPayload)
+	}
+}
+
+func TestCodexWebsocketsExecuteRetriesWithoutStalePreviousResponseID(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayloads := make(chan []byte, 3)
+	var mu sync.Mutex
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade websocket: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		msgType, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read upstream websocket message: %v", err)
+		}
+		if msgType != websocket.TextMessage {
+			t.Fatalf("message type = %d, want text", msgType)
+		}
+
+		mu.Lock()
+		requestCount++
+		idx := requestCount
+		mu.Unlock()
+		capturedPayloads <- bytes.Clone(payload)
+
+		if idx == 2 {
+			stale := []byte(`{"type":"error","status":400,"body":{"error":{"code":"previous_response_not_found","type":"invalid_request_error","message":"No response found for previous_response_id resp_ws_first"}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, stale); errWrite != nil {
+				t.Fatalf("write stale websocket error: %v", errWrite)
+			}
+			return
+		}
+
+		responseID := "resp_ws_first"
+		if idx > 2 {
+			responseID = "resp_ws_replayed"
+		}
+		completed := []byte(`{"type":"response.completed","response":{"id":"` + responseID + `","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Fatalf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-ws-stale-previous-response",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+	firstReq := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"metadata":{"user_id":"{\"device_id\":\"device-a\",\"account_uuid\":\"\",\"session_id\":\"ws-stale-previous-response-session\"}"},
+			"messages":[{"role":"user","content":[{"type":"text","text":"first"}]}]
+		}`),
+	}
+	secondReq := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"metadata":{"user_id":"{\"device_id\":\"device-b\",\"account_uuid\":\"\",\"session_id\":\"ws-stale-previous-response-session\"}"},
+			"messages":[{"role":"user","content":[{"type":"text","text":"second"}]}]
+		}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}
+
+	if _, err := exec.Execute(context.Background(), auth, firstReq, opts); err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+	if _, err := exec.Execute(context.Background(), auth, secondReq, opts); err != nil {
+		t.Fatalf("second Execute() should replay without stale previous_response_id, got error = %v", err)
+	}
+
+	firstPayload := <-capturedPayloads
+	stalePayload := <-capturedPayloads
+	replayedPayload := <-capturedPayloads
+	if got := gjson.GetBytes(firstPayload, "previous_response_id").String(); got != "" {
+		t.Fatalf("first previous_response_id = %q, want empty; payload=%s", got, firstPayload)
+	}
+	if got := gjson.GetBytes(stalePayload, "previous_response_id").String(); got != "resp_ws_first" {
+		t.Fatalf("stale attempt previous_response_id = %q, want resp_ws_first; payload=%s", got, stalePayload)
+	}
+	if got := gjson.GetBytes(replayedPayload, "previous_response_id").String(); got != "" {
+		t.Fatalf("replay previous_response_id = %q, want empty; payload=%s", got, replayedPayload)
+	}
+	if got := gjson.GetBytes(replayedPayload, "input.0.role").String(); got != "developer" {
+		t.Fatalf("replay input.0.role = %q, want developer guard; payload=%s", got, replayedPayload)
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamRetriesWithoutStalePreviousResponseID(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayloads := make(chan []byte, 3)
+	var mu sync.Mutex
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade websocket: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		msgType, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read upstream websocket message: %v", err)
+		}
+		if msgType != websocket.TextMessage {
+			t.Fatalf("message type = %d, want text", msgType)
+		}
+
+		mu.Lock()
+		requestCount++
+		idx := requestCount
+		mu.Unlock()
+		capturedPayloads <- bytes.Clone(payload)
+
+		if idx == 2 {
+			stale := []byte(`{"type":"error","status":400,"body":{"error":{"code":"previous_response_not_found","type":"invalid_request_error","message":"No response found for previous_response_id resp_ws_stream_first"}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, stale); errWrite != nil {
+				t.Fatalf("write stale websocket error: %v", errWrite)
+			}
+			return
+		}
+
+		responseID := "resp_ws_stream_first"
+		if idx > 2 {
+			responseID = "resp_ws_stream_replayed"
+		}
+		completed := []byte(`{"type":"response.completed","response":{"id":"` + responseID + `","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Fatalf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-ws-stream-stale-previous-response",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+	firstReq := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"metadata":{"user_id":"{\"device_id\":\"device-a\",\"account_uuid\":\"\",\"session_id\":\"ws-stream-stale-previous-response-session\"}"},
+			"messages":[{"role":"user","content":[{"type":"text","text":"first"}]}]
+		}`),
+	}
+	secondReq := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"metadata":{"user_id":"{\"device_id\":\"device-b\",\"account_uuid\":\"\",\"session_id\":\"ws-stream-stale-previous-response-session\"}"},
+			"messages":[{"role":"user","content":[{"type":"text","text":"second"}]}]
+		}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+
+	firstResult, err := exec.ExecuteStream(ctx, auth, firstReq, opts)
+	if err != nil {
+		t.Fatalf("first ExecuteStream() error = %v", err)
+	}
+	drainCodexWebsocketStreamResult(t, firstResult)
+
+	secondResult, err := exec.ExecuteStream(ctx, auth, secondReq, opts)
+	if err != nil {
+		t.Fatalf("second ExecuteStream() setup error = %v", err)
+	}
+	drainCodexWebsocketStreamResult(t, secondResult)
+
+	firstPayload := <-capturedPayloads
+	stalePayload := <-capturedPayloads
+	replayedPayload := <-capturedPayloads
+	if got := gjson.GetBytes(firstPayload, "previous_response_id").String(); got != "" {
+		t.Fatalf("first previous_response_id = %q, want empty; payload=%s", got, firstPayload)
+	}
+	if got := gjson.GetBytes(stalePayload, "previous_response_id").String(); got != "resp_ws_stream_first" {
+		t.Fatalf("stale stream attempt previous_response_id = %q, want resp_ws_stream_first; payload=%s", got, stalePayload)
+	}
+	if got := gjson.GetBytes(replayedPayload, "previous_response_id").String(); got != "" {
+		t.Fatalf("stream replay previous_response_id = %q, want empty; payload=%s", got, replayedPayload)
+	}
+	if got := gjson.GetBytes(replayedPayload, "input.0.role").String(); got != "developer" {
+		t.Fatalf("stream replay input.0.role = %q, want developer guard; payload=%s", got, replayedPayload)
+	}
+}
+
+func drainCodexWebsocketStreamResult(t *testing.T, result *cliproxyexecutor.StreamResult) {
+	t.Helper()
+	if result == nil {
+		t.Fatal("stream result is nil")
+	}
+	for {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				return
+			}
+			if chunk.Err != nil {
+				t.Fatalf("stream chunk error = %v", chunk.Err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for stream result to close")
+		}
 	}
 }
 
@@ -567,25 +952,41 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 	}
 }
 
-func TestApplyCodexPromptCacheHeadersClaudeRejectsBareUserID(t *testing.T) {
-	req := cliproxyexecutor.Request{
+func TestApplyCodexPromptCacheHeadersClaudeBareUserIDUsesDigestFallback(t *testing.T) {
+	firstReq := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex-claude-ws-cache-bare-user",
 		Payload: []byte(`{"metadata":{"user_id":"same-user-across-chats"},"messages":[{"role":"user","content":[{"type":"text","text":"first"}]}]}`),
 	}
+	secondReq := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex-claude-ws-cache-bare-user",
+		Payload: []byte(`{"metadata":{"user_id":"different-user-same-chat-shape"},"messages":[{"role":"user","content":[{"type":"text","text":"first"}]}]}`),
+	}
 
-	body, headers := applyCodexPromptCacheHeaders("claude", req, []byte(`{"model":"gpt-5-codex"}`))
+	firstBody, firstHeaders := applyCodexPromptCacheHeaders("claude", firstReq, []byte(`{"model":"gpt-5-codex"}`))
+	secondBody, secondHeaders := applyCodexPromptCacheHeaders("claude", secondReq, []byte(`{"model":"gpt-5-codex"}`))
 
-	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "" {
-		t.Fatalf("bare metadata.user_id must not create websocket prompt_cache_key, got %q; body=%s", got, string(body))
+	firstKey := gjson.GetBytes(firstBody, "prompt_cache_key").String()
+	secondKey := gjson.GetBytes(secondBody, "prompt_cache_key").String()
+	if !strings.HasPrefix(firstKey, "anthropic-digest-") {
+		t.Fatalf("websocket prompt_cache_key = %q, want anthropic-digest; body=%s", firstKey, string(firstBody))
 	}
-	if got := headers["session_id"]; len(got) != 0 {
-		t.Fatalf("bare metadata.user_id must not create websocket session_id, got %#v", got)
+	if secondKey != firstKey {
+		t.Fatalf("bare metadata.user_id changed websocket digest prompt_cache_key to %q, want %q", secondKey, firstKey)
 	}
-	if got := headers.Get("Session-Id"); got != "" {
-		t.Fatalf("bare metadata.user_id must not create websocket Session-Id, got %q", got)
+	if got := firstHeaders["session_id"]; len(got) != 1 || got[0] != firstKey {
+		t.Fatalf("first websocket session_id = %#v, want [%q]", got, firstKey)
 	}
-	if got := headers.Get("Conversation_id"); got != "" {
-		t.Fatalf("bare metadata.user_id must not create websocket Conversation_id, got %q", got)
+	if got := secondHeaders["session_id"]; len(got) != 1 || got[0] != firstKey {
+		t.Fatalf("second websocket session_id = %#v, want [%q]", got, firstKey)
+	}
+	if got := firstHeaders.Get("Session-Id"); got != "" {
+		t.Fatalf("websocket Session-Id = %q, want empty", got)
+	}
+	if got := firstHeaders.Get("Conversation_id"); got != firstKey {
+		t.Fatalf("first websocket Conversation_id = %q, want %q", got, firstKey)
+	}
+	if got := secondHeaders.Get("Conversation_id"); got != firstKey {
+		t.Fatalf("second websocket Conversation_id = %q, want %q", got, firstKey)
 	}
 }
 

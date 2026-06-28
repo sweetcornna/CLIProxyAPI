@@ -511,6 +511,13 @@ type CodexKey struct {
 	// Websockets enables the Responses API websocket transport for this credential.
 	Websockets bool `yaml:"websockets,omitempty" json:"websockets,omitempty"`
 
+	// OpenAICompactSupported records whether this credential is known to support /responses/compact.
+	// nil keeps the credential in the unknown tier; false excludes it from compact requests.
+	OpenAICompactSupported *bool `yaml:"openai-compact-supported,omitempty" json:"openai-compact-supported,omitempty"`
+
+	// OpenAICompactModelMapping rewrites the upstream model only for /responses/compact.
+	OpenAICompactModelMapping map[string]string `yaml:"openai-compact-model-mapping,omitempty" json:"openai-compact-model-mapping,omitempty"`
+
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
@@ -611,6 +618,14 @@ type OpenAICompatibility struct {
 	// APIKeyEntries defines API keys with optional per-key proxy configuration.
 	APIKeyEntries []OpenAICompatibilityAPIKey `yaml:"api-key-entries,omitempty" json:"api-key-entries,omitempty"`
 
+	// OpenAICompactSupported records whether this provider is known to support /responses/compact.
+	// Per-key values in APIKeyEntries override this provider-level default.
+	OpenAICompactSupported *bool `yaml:"openai-compact-supported,omitempty" json:"openai-compact-supported,omitempty"`
+
+	// OpenAICompactModelMapping rewrites the upstream model only for /responses/compact.
+	// Per-key values in APIKeyEntries override this provider-level default.
+	OpenAICompactModelMapping map[string]string `yaml:"openai-compact-model-mapping,omitempty" json:"openai-compact-model-mapping,omitempty"`
+
 	// Models defines the model configurations including aliases for routing.
 	Models []OpenAICompatibilityModel `yaml:"models" json:"models"`
 
@@ -628,6 +643,12 @@ type OpenAICompatibilityAPIKey struct {
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// OpenAICompactSupported records whether this API key is known to support /responses/compact.
+	OpenAICompactSupported *bool `yaml:"openai-compact-supported,omitempty" json:"openai-compact-supported,omitempty"`
+
+	// OpenAICompactModelMapping rewrites the upstream model only for /responses/compact.
+	OpenAICompactModelMapping map[string]string `yaml:"openai-compact-model-mapping,omitempty" json:"openai-compact-model-mapping,omitempty"`
 }
 
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,

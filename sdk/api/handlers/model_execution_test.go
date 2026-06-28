@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -248,6 +251,80 @@ func TestExecuteModelCarriesEntryAndExitProtocols(t *testing.T) {
 	}
 	if gotOpts.Query.Get("q") != "callback" {
 		t.Fatalf("executor query = %#v, want callback query", gotOpts.Query)
+	}
+}
+
+func TestExecuteModelRejectsModelOutsideBoundGroup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	allowedModel := "model-execution-allowed-model"
+	deniedModel := "model-execution-denied-model"
+	requestBody := []byte(fmt.Sprintf(`{"model":%q}`, deniedModel))
+	executeCalls := 0
+	executor := &modelExecutionCaptureExecutor{
+		execute: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+			executeCalls++
+			return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+		},
+	}
+	handler := newModelExecutionHandler(t, deniedModel, executor, &sdkconfig.SDKConfig{
+		APIKeys: []string{"sk-team"},
+		Groups: []sdkconfig.GroupConfig{
+			{Name: "team", APIKeys: []string{"sk-team"}, Models: []string{allowedModel}},
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Set("userApiKey", "sk-team")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	_, _, errMsg := handler.ExecuteWithAuthManager(ctx, "openai", deniedModel, requestBody, "")
+	if errMsg == nil {
+		t.Fatalf("expected group model denial error")
+	}
+	if errMsg.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusForbidden)
+	}
+	if executeCalls != 0 {
+		t.Fatalf("executor calls = %d, want 0", executeCalls)
+	}
+}
+
+func TestExecuteModelRejectsUngroupedAPIKeyWhenGroupsConfigured(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	model := "model-execution-ungrouped-key-model"
+	requestBody := []byte(fmt.Sprintf(`{"model":%q}`, model))
+	executeCalls := 0
+	executor := &modelExecutionCaptureExecutor{
+		execute: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+			executeCalls++
+			return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+		},
+	}
+	handler := newModelExecutionHandler(t, model, executor, &sdkconfig.SDKConfig{
+		APIKeys: []string{"sk-unbound"},
+		Groups: []sdkconfig.GroupConfig{
+			{Name: "team", APIKeys: []string{"sk-other"}},
+		},
+	})
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Set("userApiKey", "sk-unbound")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	_, _, errMsg := handler.ExecuteWithAuthManager(ctx, "openai", model, requestBody, "")
+	if errMsg == nil {
+		t.Fatalf("expected ungrouped api key error")
+	}
+	if errMsg.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusForbidden)
+	}
+	if !strings.Contains(errMsg.Error.Error(), "not bound to a group") {
+		t.Fatalf("error = %v, want group binding message", errMsg.Error)
+	}
+	if executeCalls != 0 {
+		t.Fatalf("executor calls = %d, want 0", executeCalls)
 	}
 }
 

@@ -708,10 +708,16 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 
 func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
+	if errMsg := h.validateGroupBindingAccess(ctx); errMsg != nil {
+		return nil, nil, errMsg
+	}
 	modelName, rawJSON = h.rewriteMappedModel(ctx, entryProtocol, modelName, rawJSON)
 	rawJSON = h.applyClaudeCodeCompat(ctx, entryProtocol, originalRequestedModel, modelName, rawJSON)
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
+	if errMsg := h.validateGroupModelAccess(ctx, originalRequestedModel, modelName, routeDecision.Model); errMsg != nil {
+		return nil, nil, errMsg
+	}
 	if routeDecision.ExecutorPluginID != "" {
 		return h.executeWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
@@ -778,8 +784,14 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 
 func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
+	if errMsg := h.validateGroupBindingAccess(ctx); errMsg != nil {
+		return nil, nil, errMsg
+	}
 	modelName, rawJSON = h.rewriteMappedModel(ctx, handlerType, modelName, rawJSON)
 	routeDecision := h.applyModelRouter(ctx, handlerType, modelName, rawJSON, false, execOptions)
+	if errMsg := h.validateGroupModelAccess(ctx, originalRequestedModel, modelName, routeDecision.Model); errMsg != nil {
+		return nil, nil, errMsg
+	}
 	if routeDecision.ExecutorPluginID != "" {
 		return h.countWithPluginExecutor(ctx, handlerType, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
@@ -1101,10 +1113,22 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
+	if errMsg := h.validateGroupBindingAccess(ctx); errMsg != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- errMsg
+		close(errChan)
+		return nil, nil, errChan
+	}
 	modelName, rawJSON = h.rewriteMappedModel(ctx, entryProtocol, modelName, rawJSON)
 	rawJSON = h.applyClaudeCodeCompat(ctx, entryProtocol, originalRequestedModel, modelName, rawJSON)
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
+	if errMsg := h.validateGroupModelAccess(ctx, originalRequestedModel, modelName, routeDecision.Model); errMsg != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- errMsg
+		close(errChan)
+		return nil, nil, errChan
+	}
 	if routeDecision.ExecutorPluginID != "" {
 		return h.streamWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
@@ -1778,6 +1802,7 @@ func (h *BaseAPIHandler) applyModelRouter(ctx context.Context, handlerType, mode
 	}
 	meta := requestExecutionMetadata(ctx)
 	meta[coreexecutor.RequestedModelMetadataKey] = modelName
+	h.setGroupMetadata(ctx, meta)
 	addModelExecutionSourceMetadata(meta, execOptions.InternalSource)
 	resp, ok := routeModel(ctx, host, pluginapi.ModelRouteRequest{
 		SourceFormat:   handlerType,
@@ -2065,6 +2090,9 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
 			if len(values) == 0 {
+				continue
+			}
+			if writeUpstreamRequestIDHeader(c.Writer.Header(), key, values) {
 				continue
 			}
 			c.Writer.Header().Del(key)

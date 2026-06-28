@@ -45,6 +45,8 @@ var (
 	ResolveMappedModel       = internalconfig.ResolveMappedModel
 	GroupForAPIKey           = internalconfig.GroupForAPIKey
 	GroupByName              = internalconfig.GroupByName
+	GroupHasModelScope       = internalconfig.GroupHasModelScope
+	GroupAllowsModel         = internalconfig.GroupAllowsModel
 	DefaultModelMappingRules = internalconfig.DefaultModelMappingRules
 )
 

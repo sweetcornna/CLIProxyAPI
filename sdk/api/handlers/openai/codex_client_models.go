@@ -54,6 +54,7 @@ func buildCodexClientModels(models []map[string]any) []map[string]any {
 
 		if template, ok := templates[id]; ok {
 			entry := cloneCodexClientModelMap(template)
+			applyCodexClientTemplateMetadata(entry, id, model)
 			sanitizeCodexClientReasoningMetadata(entry)
 			applyCodexClientVisibilityOverride(entry, id)
 			result = append(result, entry)
@@ -74,6 +75,26 @@ func buildCodexClientModels(models []map[string]any) []map[string]any {
 	})
 
 	return result
+}
+
+func applyCodexClientTemplateMetadata(entry map[string]any, id string, model map[string]any) {
+	info := registry.LookupModelInfo(id)
+	contextWindow := intModelValue(model, "context_length")
+
+	if info != nil {
+		if info.ContextLength > 0 {
+			contextWindow = info.ContextLength
+		}
+		if info.Type == registry.OpenAIImageModelType {
+			entry["visibility"] = "hide"
+		}
+		applyCodexClientThinkingMetadata(entry, info.Thinking)
+	}
+
+	if contextWindow > 0 {
+		entry["context_window"] = contextWindow
+		entry["max_context_window"] = contextWindow
+	}
 }
 
 func maxCodexClientTemplatePriority(templates map[string]map[string]any) int {

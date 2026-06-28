@@ -1,12 +1,32 @@
 package synthesizer
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"gopkg.in/yaml.v3"
 )
+
+func boolPtr(v bool) *bool { return &v }
+
+func compactMappingAttr(t *testing.T, auth *coreauth.Auth) map[string]string {
+	t.Helper()
+	if auth == nil || auth.Attributes == nil {
+		t.Fatal("auth attributes are empty")
+	}
+	raw := auth.Attributes["openai_compact_model_mapping"]
+	if raw == "" {
+		t.Fatal("missing openai_compact_model_mapping attribute")
+	}
+	var out map[string]string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatalf("invalid openai_compact_model_mapping JSON %q: %v", raw, err)
+	}
+	return out
+}
 
 func TestNewConfigSynthesizer(t *testing.T) {
 	synth := NewConfigSynthesizer()
@@ -254,12 +274,13 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 		Config: &config.Config{
 			CodexKey: []config.CodexKey{
 				{
-					APIKey:         "codex-key-123",
-					Prefix:         "dev",
-					BaseURL:        "https://api.openai.com",
-					ProxyURL:       "http://proxy.local",
-					Websockets:     true,
-					DisableCooling: true,
+					APIKey:                 "codex-key-123",
+					Prefix:                 "dev",
+					BaseURL:                "https://api.openai.com",
+					ProxyURL:               "http://proxy.local",
+					Websockets:             true,
+					OpenAICompactSupported: boolPtr(false),
+					DisableCooling:         true,
 				},
 			},
 		},
@@ -287,8 +308,41 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 	if auths[0].Attributes["websockets"] != "true" {
 		t.Errorf("expected websockets=true, got %s", auths[0].Attributes["websockets"])
 	}
+	if auths[0].Attributes["openai_compact_supported"] != "false" {
+		t.Errorf("expected openai_compact_supported=false, got %s", auths[0].Attributes["openai_compact_supported"])
+	}
 	if v, ok := auths[0].Metadata["disable_cooling"].(bool); !ok || !v {
 		t.Errorf("expected disable_cooling=true, got %v", auths[0].Metadata["disable_cooling"])
+	}
+}
+
+func TestConfigSynthesizer_CodexKeys_AddsCompactModelMappingAttr(t *testing.T) {
+	var cfg config.Config
+	if err := yaml.Unmarshal([]byte(`
+codex-api-key:
+  - api-key: codex-key-123
+    base-url: https://api.openai.com
+    openai-compact-model-mapping:
+      gpt-5.4: gpt-5.4-openai-compact
+`), &cfg); err != nil {
+		t.Fatalf("unexpected yaml error: %v", err)
+	}
+
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config:      &cfg,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	mapping := compactMappingAttr(t, auths[0])
+	if got := mapping["gpt-5.4"]; got != "gpt-5.4-openai-compact" {
+		t.Fatalf("compact mapping gpt-5.4 = %q, want %q", got, "gpt-5.4-openai-compact")
 	}
 }
 
@@ -318,6 +372,45 @@ func TestConfigSynthesizer_CodexKeys_SkipsEmptyAndHeaders(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_OpenAICompat_CompactModelMappingAttrSupportsPerKeyOverride(t *testing.T) {
+	var cfg config.Config
+	if err := yaml.Unmarshal([]byte(`
+openai-compatibility:
+  - name: CustomProvider
+    base-url: https://custom.api.com/v1
+    openai-compact-model-mapping:
+      gpt-5.4: provider-compact
+    api-key-entries:
+      - api-key: key-1
+      - api-key: key-2
+        openai-compact-model-mapping:
+          gpt-5.4: key-compact
+`), &cfg); err != nil {
+		t.Fatalf("unexpected yaml error: %v", err)
+	}
+
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config:      &cfg,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 2 {
+		t.Fatalf("expected 2 auths, got %d", len(auths))
+	}
+	providerMapping := compactMappingAttr(t, auths[0])
+	if got := providerMapping["gpt-5.4"]; got != "provider-compact" {
+		t.Fatalf("auth[0] compact mapping gpt-5.4 = %q, want %q", got, "provider-compact")
+	}
+	keyMapping := compactMappingAttr(t, auths[1])
+	if got := keyMapping["gpt-5.4"]; got != "key-compact" {
+		t.Fatalf("auth[1] compact mapping gpt-5.4 = %q, want %q", got, "key-compact")
+	}
+}
+
 func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -328,12 +421,13 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 			name: "with APIKeyEntries",
 			compat: []config.OpenAICompatibility{
 				{
-					Name:           "CustomProvider",
-					BaseURL:        "https://custom.api.com",
-					DisableCooling: true,
+					Name:                   "CustomProvider",
+					BaseURL:                "https://custom.api.com",
+					DisableCooling:         true,
+					OpenAICompactSupported: boolPtr(false),
 					APIKeyEntries: []config.OpenAICompatibilityAPIKey{
 						{APIKey: "key-1"},
-						{APIKey: "key-2"},
+						{APIKey: "key-2", OpenAICompactSupported: boolPtr(true)},
 					},
 				},
 			},
@@ -398,6 +492,12 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 					if v, ok := auths[i].Metadata["disable_cooling"].(bool); !ok || !v {
 						t.Fatalf("expected auth[%d].disable_cooling=true, got %v", i, auths[i].Metadata["disable_cooling"])
 					}
+				}
+				if got := auths[0].Attributes["openai_compact_supported"]; got != "false" {
+					t.Fatalf("auth[0].openai_compact_supported = %q, want false", got)
+				}
+				if got := auths[1].Attributes["openai_compact_supported"]; got != "true" {
+					t.Fatalf("auth[1].openai_compact_supported = %q, want true", got)
 				}
 			}
 		})

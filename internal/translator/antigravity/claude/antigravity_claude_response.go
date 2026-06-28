@@ -152,7 +152,15 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 
 		// Use cpaUsageMetadata within the message_start event for Claude.
 		if promptTokenCount := gjson.GetBytes(rawJSON, "response.cpaUsageMetadata.promptTokenCount"); promptTokenCount.Exists() {
-			messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.usage.input_tokens", promptTokenCount.Int())
+			cachedTokens := gjson.GetBytes(rawJSON, "response.cpaUsageMetadata.cachedContentTokenCount").Int()
+			inputTokens := promptTokenCount.Int() - cachedTokens
+			if inputTokens < 0 {
+				inputTokens = 0
+			}
+			messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.usage.input_tokens", inputTokens)
+			if cachedTokens > 0 {
+				messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.usage.cache_read_input_tokens", cachedTokens)
+			}
 		}
 		if candidatesTokenCount := gjson.GetBytes(rawJSON, "response.cpaUsageMetadata.candidatesTokenCount"); candidatesTokenCount.Exists() && !webSearchStreamMode {
 			messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.usage.output_tokens", candidatesTokenCount.Int())
@@ -474,6 +482,10 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 	thoughtTokens := root.Get("response.usageMetadata.thoughtsTokenCount").Int()
 	totalTokens := root.Get("response.usageMetadata.totalTokenCount").Int()
 	cachedTokens := root.Get("response.usageMetadata.cachedContentTokenCount").Int()
+	inputTokens := promptTokens - cachedTokens
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
 	outputTokens := candidateTokens + thoughtTokens
 	if outputTokens == 0 && totalTokens > 0 {
 		outputTokens = totalTokens - promptTokens
@@ -485,7 +497,7 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 	responseJSON := []byte(`{"id":"","type":"message","role":"assistant","model":"","content":null,"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
 	responseJSON, _ = sjson.SetBytes(responseJSON, "id", root.Get("response.responseId").String())
 	responseJSON, _ = sjson.SetBytes(responseJSON, "model", root.Get("response.modelVersion").String())
-	responseJSON, _ = sjson.SetBytes(responseJSON, "usage.input_tokens", promptTokens)
+	responseJSON, _ = sjson.SetBytes(responseJSON, "usage.input_tokens", inputTokens)
 	responseJSON, _ = sjson.SetBytes(responseJSON, "usage.output_tokens", outputTokens)
 	// Add cache_read_input_tokens if cached tokens are present (indicates prompt caching is working)
 	if cachedTokens > 0 {

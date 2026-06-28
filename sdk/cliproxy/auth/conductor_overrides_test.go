@@ -405,6 +405,76 @@ func TestManager_ModelSupportBadRequest_FallsBackAndSuspendsAuth(t *testing.T) {
 	}
 }
 
+func TestManager_GroupInvalidRequestFallbackUsesConfiguredFallbackGroup(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	invalidErr := &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error: malformed payload"}
+	executor := &authFallbackExecutor{
+		id:            "claude",
+		executeErrors: map[string]error{"aa-bad-auth": invalidErr},
+	}
+	m.RegisterExecutor(executor)
+	m.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			Groups: []internalconfig.GroupConfig{
+				{Name: "primary", Providers: []string{"claude"}, Credentials: []string{"aa-*"}, FallbackGroupOnInvalidRequest: "fallback"},
+				{Name: "fallback", Providers: []string{"claude"}, Credentials: []string{"bb-*"}},
+			},
+		},
+	})
+
+	model := "claude-opus-4-6"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.GroupNameMetadataKey: "primary"},
+	})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want fallback success", errExecute)
+	}
+	if string(resp.Payload) != goodAuth.ID {
+		t.Fatalf("payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+	}
+
+	got := executor.ExecuteCalls()
+	want := []string{badAuth.ID, goodAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestAuthMatchesGroup_DenyCredentialsRejectsEveryAuth(t *testing.T) {
+	group := &internalconfig.GroupConfig{Name: "empty-team", DenyCredentials: true}
+	auth := &Auth{ID: "codex-auth", Provider: "codex", Label: "codex-auth"}
+
+	if authMatchesGroup(auth, group) {
+		t.Fatalf("authMatchesGroup() = true, want false for deny-credentials group")
+	}
+	if !groupCredentialNarrowing(group) {
+		t.Fatalf("groupCredentialNarrowing() = false, want true for deny-credentials group")
+	}
+}
+
 func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{

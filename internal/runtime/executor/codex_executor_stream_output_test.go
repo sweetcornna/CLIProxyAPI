@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +17,26 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+type codexStreamRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f codexStreamRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type codexStreamErrorBody struct {
+	sent bool
+}
+
+func (b *codexStreamErrorBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, []byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n")), nil
+	}
+	return 0, errors.New("stream error: stream ID 1; INTERNAL_ERROR; received from peer")
+}
+
+func (b *codexStreamErrorBody) Close() error { return nil }
 
 func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -126,6 +147,55 @@ func TestCodexExecutorExecuteStreamSurfacesTerminalStreamError(t *testing.T) {
 		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, streamErr)
 	}
 	assertCodexErrorCode(t, streamErr.Error(), "invalid_request_error", "context_too_large")
+}
+
+func TestCodexExecutorExecuteStreamWrapsHTTP2InternalReset(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key": "test",
+	}}
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", codexStreamRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Hostname() != "chatgpt.com" {
+			t.Fatalf("hostname = %q, want chatgpt.com", req.URL.Hostname())
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       &codexStreamErrorBody{},
+			Request:    req,
+		}, nil
+	}))
+
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"hello","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var streamErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+			break
+		}
+	}
+	if streamErr == nil {
+		t.Fatal("missing stream reset error")
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusBadGateway {
+		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadGateway, streamErr)
+	}
+	if strings.Contains(streamErr.Error(), "stream ID 1") {
+		t.Fatalf("raw HTTP/2 stream ID leaked to downstream: %v", streamErr)
+	}
+	if !strings.Contains(streamErr.Error(), "upstream HTTP/2 stream reset") {
+		t.Fatalf("stream error = %v, want normalized upstream reset message", streamErr)
+	}
 }
 
 func TestCodexTerminalStreamContextLengthErrFromResponseFailed(t *testing.T) {

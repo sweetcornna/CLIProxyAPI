@@ -99,6 +99,14 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 		if responseIDResult := gjson.GetBytes(rawJSON, "responseId"); responseIDResult.Exists() {
 			messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.id", responseIDResult.String())
 		}
+		if usageResult := gjson.GetBytes(rawJSON, "usageMetadata"); usageResult.Exists() {
+			inputTokenCount, outputTokenCount, cachedTokenCount := geminiClaudeUsageCounts(usageResult)
+			messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.usage.input_tokens", inputTokenCount)
+			messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.usage.output_tokens", outputTokenCount)
+			if cachedTokenCount > 0 {
+				messageStartTemplate, _ = sjson.SetBytes(messageStartTemplate, "message.usage.cache_read_input_tokens", cachedTokenCount)
+			}
+		}
 		appendEvent("message_start", string(messageStartTemplate))
 
 		(*param).(*Params).HasFirstResponse = true
@@ -262,10 +270,12 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 				template = []byte(`{"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 			}
 
-			thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
-			candidatesTokenCount := usageResult.Get("candidatesTokenCount").Int()
-			template, _ = sjson.SetBytes(template, "usage.output_tokens", candidatesTokenCount+thoughtsTokenCount)
-			template, _ = sjson.SetBytes(template, "usage.input_tokens", usageResult.Get("promptTokenCount").Int())
+			inputTokenCount, outputTokenCount, cachedTokenCount := geminiClaudeUsageCounts(usageResult)
+			template, _ = sjson.SetBytes(template, "usage.output_tokens", outputTokenCount)
+			template, _ = sjson.SetBytes(template, "usage.input_tokens", inputTokenCount)
+			if cachedTokenCount > 0 {
+				template, _ = sjson.SetBytes(template, "usage.cache_read_input_tokens", cachedTokenCount)
+			}
 
 			appendEvent("message_delta", string(template))
 			(*param).(*Params).HasFinalEvents = true
@@ -273,6 +283,16 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 	}
 
 	return [][]byte{output}
+}
+
+func geminiClaudeUsageCounts(usageResult gjson.Result) (inputTokens, outputTokens, cachedTokens int64) {
+	cachedTokens = usageResult.Get("cachedContentTokenCount").Int()
+	inputTokens = usageResult.Get("promptTokenCount").Int() - cachedTokens
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+	outputTokens = usageResult.Get("candidatesTokenCount").Int() + usageResult.Get("thoughtsTokenCount").Int()
+	return inputTokens, outputTokens, cachedTokens
 }
 
 // ConvertGeminiResponseToClaudeNonStream converts a non-streaming Gemini response to a non-streaming Claude response.
@@ -296,10 +316,12 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 	out, _ = sjson.SetBytes(out, "id", root.Get("responseId").String())
 	out, _ = sjson.SetBytes(out, "model", root.Get("modelVersion").String())
 
-	inputTokens := root.Get("usageMetadata.promptTokenCount").Int()
-	outputTokens := root.Get("usageMetadata.candidatesTokenCount").Int() + root.Get("usageMetadata.thoughtsTokenCount").Int()
+	inputTokens, outputTokens, cachedTokens := geminiClaudeUsageCounts(root.Get("usageMetadata"))
 	out, _ = sjson.SetBytes(out, "usage.input_tokens", inputTokens)
 	out, _ = sjson.SetBytes(out, "usage.output_tokens", outputTokens)
+	if cachedTokens > 0 {
+		out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
+	}
 
 	parts := root.Get("candidates.0.content.parts")
 	textBuilder := strings.Builder{}

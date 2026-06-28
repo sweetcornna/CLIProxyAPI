@@ -41,12 +41,12 @@ func TestWriteErrorResponse_AddonHeadersDisabledByDefault(t *testing.T) {
 	}
 }
 
-func TestWriteErrorResponse_AddonHeadersEnabled(t *testing.T) {
+func TestWriteErrorResponse_AddonHeadersEnabledPreservesLocalRequestID(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
-	c.Writer.Header().Set("X-Request-Id", "old-value")
+	c.Writer.Header().Set("X-Request-Id", "local-request")
 
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{PassthroughHeaders: true}, nil)
 	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
@@ -64,8 +64,11 @@ func TestWriteErrorResponse_AddonHeadersEnabled(t *testing.T) {
 	if got := recorder.Header().Get("Retry-After"); got != "30" {
 		t.Fatalf("Retry-After = %q, want %q", got, "30")
 	}
-	if got := recorder.Header().Values("X-Request-Id"); !reflect.DeepEqual(got, []string{"new-1", "new-2"}) {
-		t.Fatalf("X-Request-Id = %#v, want %#v", got, []string{"new-1", "new-2"})
+	if got := recorder.Header().Values("X-Request-Id"); !reflect.DeepEqual(got, []string{"local-request"}) {
+		t.Fatalf("X-Request-Id = %#v, want local request id", got)
+	}
+	if got := recorder.Header().Values("X-Upstream-Request-Id"); !reflect.DeepEqual(got, []string{"new-1", "new-2"}) {
+		t.Fatalf("X-Upstream-Request-Id = %#v, want upstream request ids", got)
 	}
 }
 

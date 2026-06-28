@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -43,6 +44,17 @@ func shortenedCodexReplayCallIDForTest(id string) string {
 		return suffix[len(suffix)-limit:]
 	}
 	return id[:prefixLen] + suffix
+}
+
+func codexInputOffsetAfterClaudeCodeTodoGuard(t *testing.T, body []byte) int {
+	t.Helper()
+	if got := gjson.GetBytes(body, "input.0.role").String(); got != "developer" {
+		t.Fatalf("input.0.role = %q, want Claude Code developer guard; body=%s", got, string(body))
+	}
+	if got := gjson.GetBytes(body, "input.0.content.0.text").String(); !strings.Contains(got, openAICompatClaudeCodeTodoGuardMarker) {
+		t.Fatalf("input.0 missing Claude Code todo guard marker; body=%s", string(body))
+	}
+	return 1
 }
 
 func TestCodexExecutorReasoningReplayCacheStoresFinalDoneAndInjectsNextClaudeRequest(t *testing.T) {
@@ -99,14 +111,15 @@ func TestCodexExecutorReasoningReplayCacheStoresFinalDoneAndInjectsNextClaudeReq
 		t.Fatalf("upstream request count = %d, want 2", len(bodies))
 	}
 	secondBody := bodies[1]
-	if got := gjson.GetBytes(secondBody, "input.0.type").String(); got != "reasoning" {
-		t.Fatalf("input.0.type = %q, want reasoning; body=%s", got, string(secondBody))
+	offset := codexInputOffsetAfterClaudeCodeTodoGuard(t, secondBody)
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.type", offset)).String(); got != "reasoning" {
+		t.Fatalf("input.%d.type = %q, want reasoning; body=%s", offset, got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.0.encrypted_content").String(); got != doneEncryptedContent {
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.encrypted_content", offset)).String(); got != doneEncryptedContent {
 		t.Fatalf("injected encrypted_content = %q, want final done %q; body=%s", got, doneEncryptedContent, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.1.role").String(); got != "user" {
-		t.Fatalf("input.1.role = %q, want user; body=%s", got, string(secondBody))
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.role", offset+1)).String(); got != "user" {
+		t.Fatalf("input.%d.role = %q, want user; body=%s", offset+1, got, string(secondBody))
 	}
 }
 
@@ -264,10 +277,11 @@ func TestCodexExecutorReasoningReplayCacheSharesSameSessionAcrossCodexAuths(t *t
 		t.Fatalf("upstream request count = %d, want 2", len(bodies))
 	}
 	secondBody := bodies[1]
-	if got := gjson.GetBytes(secondBody, "input.0.type").String(); got != "reasoning" {
-		t.Fatalf("input.0.type = %q, want same-session replay across auths; body=%s", got, string(secondBody))
+	offset := codexInputOffsetAfterClaudeCodeTodoGuard(t, secondBody)
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.type", offset)).String(); got != "reasoning" {
+		t.Fatalf("input.%d.type = %q, want same-session replay across auths; body=%s", offset, got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.0.encrypted_content").String(); got != encryptedContent {
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.encrypted_content", offset)).String(); got != encryptedContent {
 		t.Fatalf("injected encrypted_content = %q, want cached value", got)
 	}
 }
@@ -399,7 +413,8 @@ func TestCodexExecutorReasoningReplayCacheDoesNotDuplicateClaudeClientReasoning(
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	if got := gjson.GetBytes(gotBody, "input.0.encrypted_content").String(); got != clientEncryptedContent {
+	offset := codexInputOffsetAfterClaudeCodeTodoGuard(t, gotBody)
+	if got := gjson.GetBytes(gotBody, fmt.Sprintf("input.%d.encrypted_content", offset)).String(); got != clientEncryptedContent {
 		t.Fatalf("client reasoning should be preserved, got %q want %q; body=%s", got, clientEncryptedContent, string(gotBody))
 	}
 	reasoningCount := 0
@@ -458,20 +473,21 @@ func TestCodexExecutorReasoningReplayCacheInsertsReasoningBeforeAssistantOutputI
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	if got := gjson.GetBytes(gotBody, "input.0.role").String(); got != "user" {
-		t.Fatalf("input.0.role = %q, want first user message; body=%s", got, string(gotBody))
+	offset := codexInputOffsetAfterClaudeCodeTodoGuard(t, gotBody)
+	if got := gjson.GetBytes(gotBody, fmt.Sprintf("input.%d.role", offset)).String(); got != "user" {
+		t.Fatalf("input.%d.role = %q, want first user message; body=%s", offset, got, string(gotBody))
 	}
-	if got := gjson.GetBytes(gotBody, "input.1.type").String(); got != "reasoning" {
-		t.Fatalf("input.1.type = %q, want cached reasoning before assistant output; body=%s", got, string(gotBody))
+	if got := gjson.GetBytes(gotBody, fmt.Sprintf("input.%d.type", offset+1)).String(); got != "reasoning" {
+		t.Fatalf("input.%d.type = %q, want cached reasoning before assistant output; body=%s", offset+1, got, string(gotBody))
 	}
-	if got := gjson.GetBytes(gotBody, "input.1.encrypted_content").String(); got != cachedEncryptedContent {
-		t.Fatalf("input.1.encrypted_content = %q, want cached reasoning; body=%s", got, string(gotBody))
+	if got := gjson.GetBytes(gotBody, fmt.Sprintf("input.%d.encrypted_content", offset+1)).String(); got != cachedEncryptedContent {
+		t.Fatalf("input.%d.encrypted_content = %q, want cached reasoning; body=%s", offset+1, got, string(gotBody))
 	}
-	if got := gjson.GetBytes(gotBody, "input.2.role").String(); got != "assistant" {
-		t.Fatalf("input.2.role = %q, want assistant output after cached reasoning; body=%s", got, string(gotBody))
+	if got := gjson.GetBytes(gotBody, fmt.Sprintf("input.%d.role", offset+2)).String(); got != "assistant" {
+		t.Fatalf("input.%d.role = %q, want assistant output after cached reasoning; body=%s", offset+2, got, string(gotBody))
 	}
-	if got := gjson.GetBytes(gotBody, "input.3.role").String(); got != "user" {
-		t.Fatalf("input.3.role = %q, want final user message; body=%s", got, string(gotBody))
+	if got := gjson.GetBytes(gotBody, fmt.Sprintf("input.%d.role", offset+3)).String(); got != "user" {
+		t.Fatalf("input.%d.role = %q, want final user message; body=%s", offset+3, got, string(gotBody))
 	}
 }
 
@@ -536,7 +552,8 @@ func TestCodexExecutorReasoningReplayCacheExecuteStreamStoresFinalDoneForClaude(
 		t.Fatalf("upstream request count = %d, want 2", len(bodies))
 	}
 	secondBody := bodies[1]
-	if got := gjson.GetBytes(secondBody, "input.0.encrypted_content").String(); got != doneEncryptedContent {
+	offset := codexInputOffsetAfterClaudeCodeTodoGuard(t, secondBody)
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.encrypted_content", offset)).String(); got != doneEncryptedContent {
 		t.Fatalf("stream cached encrypted_content = %q, want final done %q; body=%s", got, doneEncryptedContent, string(secondBody))
 	}
 }
@@ -690,23 +707,24 @@ func TestCodexExecutorReasoningReplayCacheReplaysFunctionCallForClaudeToolResult
 		t.Fatalf("upstream request count = %d, want 2", len(bodies))
 	}
 	secondBody := bodies[1]
-	if got := gjson.GetBytes(secondBody, "input.0.type").String(); got != "message" {
-		t.Fatalf("input.0.type = %q, want initial user message; body=%s", got, string(secondBody))
+	offset := codexInputOffsetAfterClaudeCodeTodoGuard(t, secondBody)
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.type", offset)).String(); got != "message" {
+		t.Fatalf("input.%d.type = %q, want initial user message; body=%s", offset, got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.1.type").String(); got != "reasoning" {
-		t.Fatalf("input.1.type = %q, want cached reasoning; body=%s", got, string(secondBody))
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.type", offset+1)).String(); got != "reasoning" {
+		t.Fatalf("input.%d.type = %q, want cached reasoning; body=%s", offset+1, got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.2.type").String(); got != "function_call" {
-		t.Fatalf("input.2.type = %q, want cached function_call; body=%s", got, string(secondBody))
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.type", offset+2)).String(); got != "function_call" {
+		t.Fatalf("input.%d.type = %q, want cached function_call; body=%s", offset+2, got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.2.call_id").String(); got != "call_1" {
-		t.Fatalf("input.2.call_id = %q, want call_1; body=%s", got, string(secondBody))
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.call_id", offset+2)).String(); got != "call_1" {
+		t.Fatalf("input.%d.call_id = %q, want call_1; body=%s", offset+2, got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.3.type").String(); got != "function_call_output" {
-		t.Fatalf("input.3.type = %q, want function_call_output after cached call; body=%s", got, string(secondBody))
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.type", offset+3)).String(); got != "function_call_output" {
+		t.Fatalf("input.%d.type = %q, want function_call_output after cached call; body=%s", offset+3, got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.3.call_id").String(); got != "call_1" {
-		t.Fatalf("input.3.call_id = %q, want call_1; body=%s", got, string(secondBody))
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.call_id", offset+3)).String(); got != "call_1" {
+		t.Fatalf("input.%d.call_id = %q, want call_1; body=%s", offset+3, got, string(secondBody))
 	}
 }
 
@@ -830,22 +848,23 @@ func TestCodexExecutorReasoningReplayCacheMatchesShortenedClaudeToolResultCallID
 		t.Fatalf("upstream request count = %d, want 2", len(bodies))
 	}
 	secondBody := bodies[1]
-	if got := gjson.GetBytes(secondBody, "input.0.type").String(); got != "message" {
-		t.Fatalf("input.0.type = %q, want initial user message; body=%s", got, string(secondBody))
+	offset := codexInputOffsetAfterClaudeCodeTodoGuard(t, secondBody)
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.type", offset)).String(); got != "message" {
+		t.Fatalf("input.%d.type = %q, want initial user message; body=%s", offset, got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.1.type").String(); got != "reasoning" {
-		t.Fatalf("input.1.type = %q, want cached reasoning; body=%s", got, string(secondBody))
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.type", offset+1)).String(); got != "reasoning" {
+		t.Fatalf("input.%d.type = %q, want cached reasoning; body=%s", offset+1, got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.2.type").String(); got != "function_call" {
-		t.Fatalf("input.2.type = %q, want cached function_call; body=%s", got, string(secondBody))
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.type", offset+2)).String(); got != "function_call" {
+		t.Fatalf("input.%d.type = %q, want cached function_call; body=%s", offset+2, got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.2.call_id").String(); got != shortCallID {
-		t.Fatalf("input.2.call_id = %q, want shortened call_id %q; body=%s", got, shortCallID, string(secondBody))
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.call_id", offset+2)).String(); got != shortCallID {
+		t.Fatalf("input.%d.call_id = %q, want shortened call_id %q; body=%s", offset+2, got, shortCallID, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.3.type").String(); got != "function_call_output" {
-		t.Fatalf("input.3.type = %q, want function_call_output after cached call; body=%s", got, string(secondBody))
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.type", offset+3)).String(); got != "function_call_output" {
+		t.Fatalf("input.%d.type = %q, want function_call_output after cached call; body=%s", offset+3, got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.3.call_id").String(); got != shortCallID {
-		t.Fatalf("input.3.call_id = %q, want shortened call_id %q; body=%s", got, shortCallID, string(secondBody))
+	if got := gjson.GetBytes(secondBody, fmt.Sprintf("input.%d.call_id", offset+3)).String(); got != shortCallID {
+		t.Fatalf("input.%d.call_id = %q, want shortened call_id %q; body=%s", offset+3, got, shortCallID, string(secondBody))
 	}
 }

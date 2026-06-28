@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -34,6 +35,18 @@ func resetClaudeDeviceProfileCache() {
 
 func malformedClaudeTreeSignatureForClaudeExecutorTest() string {
 	return base64.StdEncoding.EncodeToString([]byte{0x12, 0xFF, 0xFE, 0xFD})
+}
+
+func newClaudeExecutorContextWithIncomingHeaders(t *testing.T, incoming http.Header) context.Context {
+	t.Helper()
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginReq := httptest.NewRequest(http.MethodPost, "http://localhost/v1/messages", nil)
+	ginReq.Header = incoming.Clone()
+	ginCtx.Request = ginReq
+	return context.WithValue(context.Background(), "gin", ginCtx)
 }
 
 func newClaudeHeaderTestRequest(t *testing.T, incoming http.Header) *http.Request {
@@ -48,6 +61,282 @@ func newClaudeHeaderTestRequest(t *testing.T, incoming http.Header) *http.Reques
 
 	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
 	return req.WithContext(context.WithValue(req.Context(), "gin", ginCtx))
+}
+
+func TestClaudeExecutor_ExecuteInjectsClaudeCodeCompactionForSupportedModel(t *testing.T) {
+	var seenBody []byte
+	var seenBeta string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBeta = r.Header.Get("Anthropic-Beta")
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	ctx := newClaudeExecutorContextWithIncomingHeaders(t, http.Header{
+		"User-Agent":     []string{"claude-cli/2.1.161 (external, cli)"},
+		"X-App":          []string{"claude-code"},
+		"Anthropic-Beta": []string{"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27"},
+	})
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if !strings.Contains(seenBeta, "compact-2026-01-12") {
+		t.Fatalf("Anthropic-Beta = %q, want compact-2026-01-12", seenBeta)
+	}
+	if got := gjson.GetBytes(seenBody, "context_management.edits.#(type==\"compact_20260112\").type").String(); got != "compact_20260112" {
+		t.Fatalf("compact context_management edit missing from upstream body: %s", string(seenBody))
+	}
+}
+
+func TestClaudeExecutor_ExecuteDoesNotInjectCompactionForUnsupportedClaudeCodeModel(t *testing.T) {
+	var seenBody []byte
+	var seenBeta string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBeta = r.Header.Get("Anthropic-Beta")
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	ctx := newClaudeExecutorContextWithIncomingHeaders(t, http.Header{
+		"User-Agent":     []string{"claude-cli/2.1.161 (external, cli)"},
+		"X-App":          []string{"claude-code"},
+		"Anthropic-Beta": []string{"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27"},
+	})
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if strings.Contains(seenBeta, "compact-2026-01-12") {
+		t.Fatalf("Anthropic-Beta = %q, want no compact beta for unsupported model", seenBeta)
+	}
+	if gjson.GetBytes(seenBody, "context_management.edits.#(type==\"compact_20260112\")").Exists() {
+		t.Fatalf("compact context_management edit should not be injected for unsupported model: %s", string(seenBody))
+	}
+}
+
+func TestClaudeExecutor_ExecuteUsesMetadataClaudeCodeSessionHeader(t *testing.T) {
+	var seenSession string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenSession = r.Header.Get(helps.ClaudeCodeSessionHeader)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{
+		"metadata":{"user_id":"{\"device_id\":\"device-a\",\"account_uuid\":\"\",\"session_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\"}"},
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if seenSession != "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
+		t.Fatalf("%s = %q, want metadata session", helps.ClaudeCodeSessionHeader, seenSession)
+	}
+}
+
+func TestClaudeExecutorExecuteStreamAccumulatesMessageUsageCachedTokens(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, strings.Join([]string{
+			`event: message_start`,
+			`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-cache-usage-test","usage":{"input_tokens":21,"cache_creation_input_tokens":2,"cache_read_input_tokens":0,"cached_tokens":13}}}`,
+			``,
+			`event: message_delta`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":34}}`,
+			``,
+			`event: message_stop`,
+			`data: {"type":"message_stop"}`,
+			``,
+		}, "\n"))
+	}))
+	defer server.Close()
+
+	plugin := &captureClaudeUsagePlugin{records: make(chan usage.Record, 16)}
+	usage.RegisterPlugin(plugin)
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	stream, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-cache-usage-test",
+		Payload: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+
+	record := waitForClaudeUsageRecord(t, plugin.records, "claude-cache-usage-test")
+	if record.Detail.InputTokens != 21 {
+		t.Fatalf("input tokens = %d, want %d", record.Detail.InputTokens, 21)
+	}
+	if record.Detail.OutputTokens != 34 {
+		t.Fatalf("output tokens = %d, want %d", record.Detail.OutputTokens, 34)
+	}
+	if record.Detail.CacheReadTokens != 13 {
+		t.Fatalf("cache read tokens = %d, want %d", record.Detail.CacheReadTokens, 13)
+	}
+	if record.Detail.CacheCreationTokens != 2 {
+		t.Fatalf("cache creation tokens = %d, want %d", record.Detail.CacheCreationTokens, 2)
+	}
+	if record.Detail.TotalTokens != 70 {
+		t.Fatalf("total tokens = %d, want %d", record.Detail.TotalTokens, 70)
+	}
+}
+
+type captureClaudeUsagePlugin struct {
+	records chan usage.Record
+}
+
+func (p *captureClaudeUsagePlugin) HandleUsage(_ context.Context, record usage.Record) {
+	if p == nil {
+		return
+	}
+	select {
+	case p.records <- record:
+	default:
+	}
+}
+
+func waitForClaudeUsageRecord(t *testing.T, records <-chan usage.Record, model string) usage.Record {
+	t.Helper()
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case record := <-records:
+			if record.Provider == "claude" && record.Model == model {
+				return record
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for Claude usage record")
+		}
+	}
+}
+
+func TestClaudeExecutor_ExecuteStreamInjectsClaudeCodeCompactionForSupportedModel(t *testing.T) {
+	var seenBody []byte
+	var seenBeta string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBeta = r.Header.Get("Anthropic-Beta")
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	ctx := newClaudeExecutorContextWithIncomingHeaders(t, http.Header{
+		"User-Agent":     []string{"claude-cli/2.1.161 (external, cli)"},
+		"X-App":          []string{"claude-code"},
+		"Anthropic-Beta": []string{"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27"},
+	})
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"stream":true}`)
+
+	result, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+
+	if !strings.Contains(seenBeta, "compact-2026-01-12") {
+		t.Fatalf("Anthropic-Beta = %q, want compact-2026-01-12", seenBeta)
+	}
+	if got := gjson.GetBytes(seenBody, "context_management.edits.#(type==\"compact_20260112\").type").String(); got != "compact_20260112" {
+		t.Fatalf("compact context_management edit missing from upstream stream body: %s", string(seenBody))
+	}
+}
+
+func TestApplyClaudeCodeMessagesCompactionAppendsWithoutDuplicating(t *testing.T) {
+	ctx := newClaudeExecutorContextWithIncomingHeaders(t, http.Header{
+		"User-Agent": []string{"claude-cli/2.1.161 (external, cli)"},
+		"X-App":      []string{"claude-code"},
+	})
+	body := []byte(`{"model":"claude-opus-4-6","context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]},"messages":[]}`)
+
+	out, betas := applyClaudeCodeMessagesCompaction(ctx, body, "claude-opus-4-6-thinking", []string{"compact-2026-01-12"})
+
+	edits := gjson.GetBytes(out, "context_management.edits").Array()
+	if len(edits) != 2 {
+		t.Fatalf("context_management.edits length = %d, want 2: %s", len(edits), string(out))
+	}
+	if got := gjson.GetBytes(out, "context_management.edits.#(type==\"clear_thinking_20251015\").type").String(); got != "clear_thinking_20251015" {
+		t.Fatalf("clear_thinking edit was not preserved: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "context_management.edits.#(type==\"compact_20260112\").type").String(); got != "compact_20260112" {
+		t.Fatalf("compact edit was not appended: %s", string(out))
+	}
+	if len(betas) != 1 || betas[0] != "compact-2026-01-12" {
+		t.Fatalf("betas = %#v, want one compact beta", betas)
+	}
+
+	outAgain, betasAgain := applyClaudeCodeMessagesCompaction(ctx, out, "claude-opus-4-6-thinking", betas)
+	if got := len(gjson.GetBytes(outAgain, "context_management.edits.#(type==\"compact_20260112\")#").Array()); got != 1 {
+		t.Fatalf("compact edit count = %d, want 1 after second pass: %s", got, string(outAgain))
+	}
+	if len(betasAgain) != 1 || betasAgain[0] != "compact-2026-01-12" {
+		t.Fatalf("betas after second pass = %#v, want one compact beta", betasAgain)
+	}
 }
 
 func assertClaudeFingerprint(t *testing.T, headers http.Header, userAgent, pkgVersion, runtimeVersion, osName, arch string) {
@@ -1647,6 +1936,60 @@ func TestEnforceCacheControlLimit_ToolOnlyPayloadStillRespectsLimit(t *testing.T
 	}
 	if !gjson.GetBytes(out, "tools.4.cache_control").Exists() {
 		t.Fatalf("last tool cache_control should be preserved when possible")
+	}
+}
+
+func TestClaudeExecutor_ExecuteAddsToolAndSystemCacheWhenMessagesAlreadyHaveCacheControl(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet-20241022","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{
+		"model":"claude-3-5-sonnet-20241022",
+		"tools":[
+			{"name":"Read","description":"read files","input_schema":{"type":"object"}},
+			{"name":"Write","description":"write files","input_schema":{"type":"object"}}
+		],
+		"system":[{"type":"text","text":"project instructions"}],
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"first task"}]},
+			{"role":"assistant","content":[{"type":"text","text":"ok"}]},
+			{"role":"user","content":[{"type":"text","text":"continue","cache_control":{"type":"ephemeral"}}]}
+		]
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected upstream request body to be captured")
+	}
+	if got := gjson.GetBytes(seenBody, "tools.1.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("tools.1.cache_control.type = %q, want ephemeral; body=%s", got, string(seenBody))
+	}
+	systemLast := int(gjson.GetBytes(seenBody, "system.#").Int()) - 1
+	if systemLast < 0 {
+		t.Fatalf("system blocks missing; body=%s", string(seenBody))
+	}
+	if got := gjson.GetBytes(seenBody, fmt.Sprintf("system.%d.cache_control.type", systemLast)).String(); got != "ephemeral" {
+		t.Fatalf("system.%d.cache_control.type = %q, want ephemeral; body=%s", systemLast, got, string(seenBody))
+	}
+	if got := gjson.GetBytes(seenBody, "messages.2.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("existing message cache_control should be preserved, got %q; body=%s", got, string(seenBody))
 	}
 }
 

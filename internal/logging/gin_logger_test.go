@@ -60,6 +60,12 @@ func TestGinLogrusRecoveryHandlesRegularPanic(t *testing.T) {
 }
 
 func TestIsAIAPIPathIncludesImages(t *testing.T) {
+	if !isAIAPIPath("/v1/models") {
+		t.Fatalf("expected /v1/models to be treated as AI API path")
+	}
+	if !isAIAPIPath("/v1/models/gpt-5.5") {
+		t.Fatalf("expected /v1/models/gpt-5.5 to be treated as AI API path")
+	}
 	if !isAIAPIPath("/v1/images/generations") {
 		t.Fatalf("expected /v1/images/generations to be treated as AI API path")
 	}
@@ -121,5 +127,41 @@ func TestGinLogrusLoggerAddsRequestIDForCodexBackend(t *testing.T) {
 	}
 	if requestIDFromGin != requestIDFromContext {
 		t.Fatalf("expected Gin request ID %q to match context request ID %q", requestIDFromGin, requestIDFromContext)
+	}
+	if got := recorder.Header().Get("X-Request-Id"); got != requestIDFromContext {
+		t.Fatalf("response X-Request-Id = %q, want generated request ID %q", got, requestIDFromContext)
+	}
+}
+
+func TestGinLogrusLoggerReusesInboundRequestID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	engine := gin.New()
+	engine.Use(GinLogrusLogger())
+
+	var requestIDFromContext string
+	var requestIDFromGin string
+	engine.POST("/v1/responses", func(c *gin.Context) {
+		requestIDFromContext = GetRequestID(c.Request.Context())
+		requestIDFromGin = GetGinRequestID(c)
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("X-Request-Id", "edge-request-123")
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", recorder.Code)
+	}
+	if requestIDFromContext != "edge-request-123" {
+		t.Fatalf("context request ID = %q, want inbound request ID", requestIDFromContext)
+	}
+	if requestIDFromGin != "edge-request-123" {
+		t.Fatalf("Gin request ID = %q, want inbound request ID", requestIDFromGin)
+	}
+	if got := recorder.Header().Get("X-Request-Id"); got != "edge-request-123" {
+		t.Fatalf("response X-Request-Id = %q, want inbound request ID", got)
 	}
 }

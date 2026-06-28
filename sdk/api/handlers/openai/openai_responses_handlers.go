@@ -359,7 +359,7 @@ func (h *OpenAIResponsesAPIHandler) Models() []map[string]any {
 func (h *OpenAIResponsesAPIHandler) OpenAIResponsesModels(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
-		"data":   h.Models(),
+		"data":   h.ModelsForRequest(c, h.Models()),
 	})
 }
 
@@ -392,6 +392,42 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 
 }
 
+var responsesCompactAllowedRequestFields = []string{
+	"model",
+	"input",
+	"instructions",
+	"tools",
+	"parallel_tool_calls",
+	"reasoning",
+	"text",
+	"previous_response_id",
+}
+
+func normalizeResponsesCompactRequestBody(rawJSON []byte) ([]byte, error) {
+	trimmed := bytes.TrimSpace(rawJSON)
+	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		return rawJSON, nil
+	}
+
+	normalized := []byte(`{}`)
+	for _, field := range responsesCompactAllowedRequestFields {
+		value := gjson.GetBytes(rawJSON, field)
+		if !value.Exists() {
+			continue
+		}
+		updated, err := sjson.SetRawBytes(normalized, field, []byte(value.Raw))
+		if err != nil {
+			return rawJSON, fmt.Errorf("normalize compact request body %q: %w", field, err)
+		}
+		normalized = updated
+	}
+
+	if bytes.Equal(trimmed, bytes.TrimSpace(normalized)) {
+		return rawJSON, nil
+	}
+	return normalized, nil
+}
+
 func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 	rawJSON, err := handlers.ReadRequestBody(c)
 	if err != nil {
@@ -404,6 +440,16 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		return
 	}
 
+	rawJSON, err = normalizeResponsesCompactRequestBody(rawJSON)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid compact request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if streamResult.Type == gjson.True {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
@@ -413,11 +459,6 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 			},
 		})
 		return
-	}
-	if streamResult.Exists() {
-		if updated, err := sjson.DeleteBytes(rawJSON, "stream"); err == nil {
-			rawJSON = updated
-		}
 	}
 
 	c.Header("Content-Type", "application/json")

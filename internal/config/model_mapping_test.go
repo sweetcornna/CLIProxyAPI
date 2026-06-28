@@ -19,7 +19,11 @@ groups:
     model-mapping:
       rules:
         - { pattern: "claude-*", target: "gpt-5.4" }
+    models: ["gpt-5.4", "gpt-5.4-*"]
+    deny-models: true
+    deny-credentials: true
     fallback-group: "default"
+    fallback-group-on-invalid-request: "default"
 claude-compat:
   enabled: true
   subagent-nudge: true
@@ -43,10 +47,36 @@ claude-compat:
 	// Group parsed, provider lowercased, model-mapping present.
 	if g := GroupForAPIKey(cfg.Groups, "sk-1m"); g == nil || g.Providers[0] != "codex" || len(g.ModelMapping.Rules) != 1 {
 		t.Errorf("group not parsed/sanitized: %+v", cfg.Groups)
+	} else if g.FallbackGroupOnInvalidRequest != "default" {
+		t.Errorf("fallback-group-on-invalid-request not parsed: %+v", cfg.Groups)
+	} else if !g.DenyCredentials {
+		t.Errorf("deny-credentials not parsed: %+v", cfg.Groups)
+	} else if len(g.Models) != 2 || g.Models[0] != "gpt-5.4" || !g.DenyModels {
+		t.Errorf("models/deny-models not parsed: %+v", cfg.Groups)
 	}
 	// Compat enabled by default.
 	if !cfg.ClaudeCompat.SubagentNudgeEnabled() {
 		t.Errorf("claude-compat should be enabled")
+	}
+}
+
+func TestGroupAllowsModel_UsesExactAndGlobFilters(t *testing.T) {
+	group := &GroupConfig{Name: "team", Models: []string{"gpt-5.4", "claude-*"}}
+
+	if !GroupAllowsModel(group, "gpt-5.4") {
+		t.Fatalf("expected exact model to be allowed")
+	}
+	if !GroupAllowsModel(group, "claude-sonnet-4-5") {
+		t.Fatalf("expected glob model to be allowed")
+	}
+	if GroupAllowsModel(group, "gpt-5.5") {
+		t.Fatalf("expected unlisted model to be denied")
+	}
+	if GroupAllowsModel(&GroupConfig{Name: "empty", DenyModels: true}, "gpt-5.4") {
+		t.Fatalf("expected deny-models group to deny every model")
+	}
+	if !GroupAllowsModel(&GroupConfig{Name: "legacy"}, "gpt-5.5") {
+		t.Fatalf("expected legacy group without model filters to allow every model")
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
 
 func TestConvertGeminiResponseToClaude_SignatureOnlyPartDoesNotOpenEmptyTextBlock(t *testing.T) {
@@ -59,4 +61,112 @@ func TestConvertGeminiResponseToClaude_SignatureOnlyPartDoesNotOpenEmptyTextBloc
 	if !strings.Contains(outputText, `"type":"message_stop"`) {
 		t.Fatalf("DONE chunk must still emit message_stop after final events: %s", outputText)
 	}
+}
+
+func TestConvertGeminiResponseToClaudeNonStream_CachedContentUsesClaudeInputSemantics(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-test","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	responseJSON := []byte(`{
+		"candidates": [{
+			"content": {
+				"parts": [{"text": "ok"}]
+			},
+			"finishReason": "STOP"
+		}],
+		"usageMetadata": {
+			"promptTokenCount": 100,
+			"candidatesTokenCount": 5,
+			"cachedContentTokenCount": 40,
+			"totalTokenCount": 105
+		},
+		"modelVersion": "gemini-test",
+		"responseId": "resp-test"
+	}`)
+
+	output := ConvertGeminiResponseToClaudeNonStream(context.Background(), "gemini-test", requestJSON, requestJSON, responseJSON, nil)
+
+	if got := gjson.GetBytes(output, "usage.input_tokens").Int(); got != 60 {
+		t.Fatalf("usage.input_tokens = %d, want 60: %s", got, output)
+	}
+	if got := gjson.GetBytes(output, "usage.cache_read_input_tokens").Int(); got != 40 {
+		t.Fatalf("usage.cache_read_input_tokens = %d, want 40: %s", got, output)
+	}
+}
+
+func TestConvertGeminiResponseToClaudeStream_CachedContentUsesClaudeInputSemantics(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-test","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	responseJSON := []byte(`{
+		"candidates": [{
+			"content": {
+				"parts": [{"text": "ok"}]
+			},
+			"finishReason": "STOP"
+		}],
+		"usageMetadata": {
+			"promptTokenCount": 100,
+			"candidatesTokenCount": 5,
+			"cachedContentTokenCount": 40,
+			"totalTokenCount": 105
+		},
+		"modelVersion": "gemini-test",
+		"responseId": "resp-test"
+	}`)
+
+	var param any
+	output := string(bytes.Join(ConvertGeminiResponseToClaude(context.Background(), "gemini-test", requestJSON, requestJSON, responseJSON, &param), nil))
+	messageDelta := geminiClaudeSSEDataForEvent(t, output, "message_delta")
+
+	if got := gjson.Get(messageDelta, "usage.input_tokens").Int(); got != 60 {
+		t.Fatalf("usage.input_tokens = %d, want 60: %s", got, messageDelta)
+	}
+	if got := gjson.Get(messageDelta, "usage.cache_read_input_tokens").Int(); got != 40 {
+		t.Fatalf("usage.cache_read_input_tokens = %d, want 40: %s", got, messageDelta)
+	}
+}
+
+func TestConvertGeminiResponseToClaudeStream_MessageStartCarriesCachedInputUsage(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-test","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	responseJSON := []byte(`{
+		"candidates": [{
+			"content": {
+				"parts": [{"text": "ok"}]
+			}
+		}],
+		"usageMetadata": {
+			"promptTokenCount": 100,
+			"candidatesTokenCount": 5,
+			"cachedContentTokenCount": 40,
+			"totalTokenCount": 105
+		},
+		"modelVersion": "gemini-test",
+		"responseId": "resp-test"
+	}`)
+
+	var param any
+	output := string(bytes.Join(ConvertGeminiResponseToClaude(context.Background(), "gemini-test", requestJSON, requestJSON, responseJSON, &param), nil))
+	messageStart := geminiClaudeSSEDataForEvent(t, output, "message_start")
+
+	if got := gjson.Get(messageStart, "message.usage.input_tokens").Int(); got != 60 {
+		t.Fatalf("message_start input_tokens = %d, want 60: %s", got, messageStart)
+	}
+	if got := gjson.Get(messageStart, "message.usage.cache_read_input_tokens").Int(); got != 40 {
+		t.Fatalf("message_start cache_read_input_tokens = %d, want 40: %s", got, messageStart)
+	}
+}
+
+func geminiClaudeSSEDataForEvent(t *testing.T, output string, eventName string) string {
+	t.Helper()
+
+	currentEvent := ""
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "event: ") {
+			currentEvent = strings.TrimPrefix(line, "event: ")
+			continue
+		}
+		if currentEvent == eventName && strings.HasPrefix(line, "data: ") {
+			return strings.TrimPrefix(line, "data: ")
+		}
+	}
+
+	t.Fatalf("event %q not found in:\n%s", eventName, output)
+	return ""
 }

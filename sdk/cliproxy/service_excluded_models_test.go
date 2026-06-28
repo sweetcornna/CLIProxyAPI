@@ -68,6 +68,53 @@ func TestRegisterModelsForAuth_UsesPreMergedExcludedModelsAttribute(t *testing.T
 	}
 }
 
+func TestRegisterResolvedModelsForAuth_AppliesModelContextOverrides(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{
+				ModelContextOverrides: map[string]int{
+					"gpt-5.5": 400000,
+					"gpt-5.4": 1050000,
+				},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-context-override",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}
+
+	modelRegistry := internalregistry.GetGlobalRegistry()
+	modelRegistry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(auth.ID)
+	})
+
+	service.registerResolvedModelsForAuth(auth, "codex", []*ModelInfo{
+		{ID: "gpt-5.5", ContextLength: 272000},
+		{ID: "gpt-5.4", ContextLength: 1000000},
+		{ID: "gpt-5.4-mini", ContextLength: 400000},
+	})
+
+	models := modelRegistry.GetModelsForClient(auth.ID)
+	byID := make(map[string]*internalregistry.ModelInfo, len(models))
+	for _, model := range models {
+		if model != nil {
+			byID[model.ID] = model
+		}
+	}
+	if byID["gpt-5.5"].ContextLength != 400000 {
+		t.Fatalf("gpt-5.5 context = %d, want 400000", byID["gpt-5.5"].ContextLength)
+	}
+	if byID["gpt-5.4"].ContextLength != 1050000 {
+		t.Fatalf("gpt-5.4 context = %d, want 1050000", byID["gpt-5.4"].ContextLength)
+	}
+	if byID["gpt-5.4-mini"].ContextLength != 400000 {
+		t.Fatalf("gpt-5.4-mini context = %d, want unchanged 400000", byID["gpt-5.4-mini"].ContextLength)
+	}
+}
+
 func TestRegisterModelsForAuth_OpenAICompatibilityImageModelType(t *testing.T) {
 	service := &Service{
 		cfg: &config.Config{

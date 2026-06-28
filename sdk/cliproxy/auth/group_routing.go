@@ -40,6 +40,9 @@ func authMatchesGroup(auth *Auth, grp *internalconfig.GroupConfig) bool {
 	if auth == nil || grp == nil {
 		return false
 	}
+	if grp.DenyCredentials {
+		return false
+	}
 	if len(grp.Providers) == 0 && len(grp.Credentials) == 0 {
 		return true
 	}
@@ -60,6 +63,13 @@ func authMatchesGroup(auth *Auth, grp *internalconfig.GroupConfig) bool {
 		return false
 	}
 	return true
+}
+
+// AuthMatchesGroup reports whether auth belongs to grp's credential selection.
+// It is exported for API discovery endpoints that need the same group scoping as
+// request-time auth selection.
+func AuthMatchesGroup(auth *Auth, grp *internalconfig.GroupConfig) bool {
+	return authMatchesGroup(auth, grp)
 }
 
 // authLabelMatchesAny matches an auth's label/id (and their basenames) against a
@@ -89,7 +99,7 @@ func authLabelMatchesAny(auth *Auth, patterns []string) bool {
 
 // groupCredentialNarrowing reports whether grp restricts the credential set at all.
 func groupCredentialNarrowing(grp *internalconfig.GroupConfig) bool {
-	return grp != nil && (len(grp.Providers) > 0 || len(grp.Credentials) > 0)
+	return grp != nil && (grp.DenyCredentials || len(grp.Providers) > 0 || len(grp.Credentials) > 0)
 }
 
 // seedOutOfGroupTried marks every auth that is NOT part of grp's credential
@@ -143,6 +153,23 @@ func (m *Manager) resolveFallbackGroups(grp *internalconfig.GroupConfig) []*inte
 	return out
 }
 
+// resolveInvalidRequestFallbackGroup returns the direct fallback group used when
+// a request-shape invalid_request error is returned by the primary group.
+func (m *Manager) resolveInvalidRequestFallbackGroup(grp *internalconfig.GroupConfig) *internalconfig.GroupConfig {
+	if grp == nil || strings.TrimSpace(grp.FallbackGroupOnInvalidRequest) == "" {
+		return nil
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return nil
+	}
+	name := strings.TrimSpace(grp.FallbackGroupOnInvalidRequest)
+	if name == "" || name == strings.TrimSpace(grp.Name) {
+		return nil
+	}
+	return internalconfig.GroupByName(cfg.Groups, name)
+}
+
 // admitGroupAuths removes grp's matching auths from the tried set so the scheduler
 // may select them. Used when falling back to a secondary group after the primary
 // group's credentials are exhausted.
@@ -158,4 +185,33 @@ func (m *Manager) admitGroupAuths(grp *internalconfig.GroupConfig, tried map[str
 			delete(tried, a.ID)
 		}
 	}
+}
+
+func (m *Manager) switchToGroupAuths(grp *internalconfig.GroupConfig, tried map[string]struct{}) {
+	if grp == nil || tried == nil {
+		return
+	}
+	for _, a := range m.snapshotAuths() {
+		if a == nil || a.ID == "" {
+			continue
+		}
+		if authMatchesGroup(a, grp) {
+			delete(tried, a.ID)
+		} else {
+			tried[a.ID] = struct{}{}
+		}
+	}
+}
+
+func (m *Manager) admitInvalidRequestFallback(grp *internalconfig.GroupConfig, tried map[string]struct{}, used *bool) bool {
+	if used == nil || *used {
+		return false
+	}
+	next := m.resolveInvalidRequestFallbackGroup(grp)
+	if next == nil {
+		return false
+	}
+	*used = true
+	m.switchToGroupAuths(next, tried)
+	return true
 }

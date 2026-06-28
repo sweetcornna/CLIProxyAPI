@@ -207,6 +207,7 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerPrefersWebsocketTransport(providerKey) && pinnedAuthID == ""
+	preferCompact := compactRequest(opts)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,7 +236,7 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
+	if picked := shard.pickReadyLocked(preferWebsocket, preferCompact, strategy, predicate); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -278,6 +279,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	modelKey := canonicalModelKey(model)
+	preferCompact := compactRequest(opts)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -304,7 +306,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
-		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
+		if picked := shard.pickReadyLocked(false, preferCompact, strategy, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -314,24 +316,43 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false
+	candidatePredicate := predicate
 	now := time.Now()
-	for providerIndex, providerKey := range normalized {
-		providerState := s.providers[providerKey]
-		if providerState == nil {
-			continue
+	compactTiers := []int{0}
+	if preferCompact {
+		compactTiers = []int{2, 1}
+	}
+	for _, tier := range compactTiers {
+		localPredicate := predicate
+		if preferCompact {
+			localPredicate = compactTierPredicate(predicate, tier)
 		}
-		shard := providerState.ensureModelLocked(modelKey, now)
-		candidateShards[providerIndex] = shard
-		if shard == nil {
-			continue
+		localBestPriority := 0
+		localHasCandidate := false
+		for providerIndex, providerKey := range normalized {
+			providerState := s.providers[providerKey]
+			if providerState == nil {
+				continue
+			}
+			shard := providerState.ensureModelLocked(modelKey, now)
+			candidateShards[providerIndex] = shard
+			if shard == nil {
+				continue
+			}
+			priorityReady, okPriority := shard.highestReadyPriorityLocked(false, localPredicate)
+			if !okPriority {
+				continue
+			}
+			if !localHasCandidate || priorityReady > localBestPriority {
+				localBestPriority = priorityReady
+				localHasCandidate = true
+			}
 		}
-		priorityReady, okPriority := shard.highestReadyPriorityLocked(false, predicate)
-		if !okPriority {
-			continue
-		}
-		if !hasCandidate || priorityReady > bestPriority {
-			bestPriority = priorityReady
+		if localHasCandidate {
+			bestPriority = localBestPriority
 			hasCandidate = true
+			candidatePredicate = localPredicate
+			break
 		}
 	}
 	if !hasCandidate {
@@ -344,7 +365,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, candidatePredicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -360,7 +381,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	for providerIndex, shard := range candidateShards {
 		segmentStarts[providerIndex] = totalWeight
 		if shard != nil {
-			weights[providerIndex] = shard.readyCountAtPriorityLocked(false, bestPriority)
+			weights[providerIndex] = shard.readyCountAtPriorityLocked(false, bestPriority, candidatePredicate)
 		}
 		totalWeight += weights[providerIndex]
 		segmentEnds[providerIndex] = totalWeight
@@ -398,7 +419,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, candidatePredicate)
 		if picked == nil {
 			continue
 		}
@@ -730,17 +751,40 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 	}
 }
 
-// pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+// pickReadyLocked selects the next ready auth from the highest available capability/priority bucket.
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, preferCompact bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
 	m.promoteExpiredLocked(time.Now())
+	if preferCompact {
+		for _, tier := range []int{2, 1} {
+			tierPredicate := compactTierPredicate(predicate, tier)
+			priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocket, tierPredicate)
+			if !okPriority {
+				continue
+			}
+			return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, tierPredicate)
+		}
+		return nil
+	}
 	priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocket, predicate)
 	if !okPriority {
 		return nil
 	}
 	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+}
+
+func compactTierPredicate(predicate func(*scheduledAuth) bool, tier int) func(*scheduledAuth) bool {
+	return func(entry *scheduledAuth) bool {
+		if entry == nil || entry.auth == nil {
+			return false
+		}
+		if predicate != nil && !predicate(entry) {
+			return false
+		}
+		return authOpenAICompactSupportTier(entry.auth) == tier
+	}
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -800,7 +844,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	return picked.auth
 }
 
-func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int) int {
+func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int, predicate func(*scheduledAuth) bool) int {
 	if m == nil {
 		return 0
 	}
@@ -808,10 +852,10 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 	if bucket == nil {
 		return 0
 	}
-	if preferWebsocket && len(bucket.ws.flat) > 0 {
-		return len(bucket.ws.flat)
+	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
+		return bucket.ws.count(predicate)
 	}
-	return len(bucket.all.flat)
+	return bucket.all.count(predicate)
 }
 
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
@@ -973,4 +1017,20 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 		return entry
 	}
 	return nil
+}
+
+func (v *readyView) count(predicate func(*scheduledAuth) bool) int {
+	if len(v.flat) == 0 {
+		return 0
+	}
+	if predicate == nil {
+		return len(v.flat)
+	}
+	count := 0
+	for _, entry := range v.flat {
+		if predicate(entry) {
+			count++
+		}
+	}
+	return count
 }

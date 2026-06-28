@@ -172,6 +172,68 @@ func authWebsocketsEnabled(auth *Auth) bool {
 	return false
 }
 
+func compactRequest(opts cliproxyexecutor.Options) bool {
+	return !opts.Stream && strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact")
+}
+
+func authOpenAICompactSupportTier(auth *Auth) int {
+	supported, known := authOpenAICompactSupportKnown(auth)
+	if !known {
+		return 1
+	}
+	if supported {
+		return 2
+	}
+	return 0
+}
+
+func authOpenAICompactSupportKnown(auth *Auth) (bool, bool) {
+	if auth == nil {
+		return false, false
+	}
+	for _, key := range []string{"openai_compact_mode", "compact_mode"} {
+		if len(auth.Attributes) > 0 {
+			if supported, ok := parseOpenAICompactMode(auth.Attributes[key]); ok {
+				return supported, true
+			}
+		}
+		if len(auth.Metadata) > 0 {
+			if supported, ok := parseOpenAICompactMode(auth.Metadata[key]); ok {
+				return supported, true
+			}
+		}
+	}
+	for _, key := range []string{"openai_compact_supported", "compact_supported", "supports_compact", "responses_compact", "compact"} {
+		if len(auth.Attributes) > 0 {
+			if supported, ok := parseBoolAny(auth.Attributes[key]); ok {
+				return supported, true
+			}
+		}
+		if len(auth.Metadata) > 0 {
+			if supported, ok := parseBoolAny(auth.Metadata[key]); ok {
+				return supported, true
+			}
+		}
+	}
+	return false, false
+}
+
+func parseOpenAICompactMode(raw any) (bool, bool) {
+	value, ok := raw.(string)
+	if !ok {
+		return false, false
+	}
+	normalized := strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.ToLower(strings.TrimSpace(value)))
+	switch normalized {
+	case "forceon", "on", "enable", "enabled", "true", "yes", "supported":
+		return true, true
+	case "forceoff", "off", "disable", "disabled", "false", "no", "unsupported":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 func preferCodexWebsocketAuths(ctx context.Context, provider string, available []*Auth) []*Auth {
 	if len(available) == 0 {
 		return available

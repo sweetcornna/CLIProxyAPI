@@ -26,6 +26,9 @@ func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	if detail.CachedTokens != 4 {
 		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 4)
 	}
+	if detail.CacheReadTokens != 4 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 4)
+	}
 	if detail.ReasoningTokens != 5 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 5)
 	}
@@ -45,6 +48,9 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 	if detail.CachedTokens != 7 {
 		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 7)
+	}
+	if detail.CacheReadTokens != 7 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 7)
 	}
 	if detail.ReasoningTokens != 9 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 9)
@@ -84,8 +90,28 @@ func TestParseOpenAIStreamUsageResponsesFields(t *testing.T) {
 	if detail.CachedTokens != 3 {
 		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 3)
 	}
+	if detail.CacheReadTokens != 3 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 3)
+	}
 	if detail.ReasoningTokens != 2 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 2)
+	}
+}
+
+func TestParseCodexUsageMapsCacheCounters(t *testing.T) {
+	data := []byte(`{"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":5,"input_tokens_details":{"cached_tokens":3},"cache_creation_input_tokens":11}}}`)
+	detail, ok := ParseCodexUsage(data)
+	if !ok {
+		t.Fatal("ParseCodexUsage() ok = false, want true")
+	}
+	if detail.CachedTokens != 3 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 3)
+	}
+	if detail.CacheReadTokens != 3 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 3)
+	}
+	if detail.CacheCreationTokens != 11 {
+		t.Fatalf("cache creation tokens = %d, want %d", detail.CacheCreationTokens, 11)
 	}
 }
 
@@ -120,6 +146,118 @@ func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
 	}
 	if detail.TotalTokens != 22852 {
 		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 22852)
+	}
+}
+
+func TestParseClaudeUsageFallsBackCacheReadToCachedTokens(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":21,"output_tokens":34,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cached_tokens":13}}`)
+	detail := ParseClaudeUsage(data)
+	if detail.CacheReadTokens != 13 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 13)
+	}
+	if detail.CachedTokens != 13 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 13)
+	}
+	if detail.TotalTokens != 68 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 68)
+	}
+
+	explicit := ParseClaudeUsage([]byte(`{"usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":7,"cached_tokens":99}}`))
+	if explicit.CacheReadTokens != 7 {
+		t.Fatalf("explicit cache read tokens = %d, want %d", explicit.CacheReadTokens, 7)
+	}
+}
+
+func TestParseClaudeStreamUsageReadsMessageUsageCachedTokens(t *testing.T) {
+	line := []byte(`data: {"type":"message_start","message":{"usage":{"input_tokens":23,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cached_tokens":23}}}`)
+	detail, ok := ParseClaudeStreamUsage(line)
+	if !ok {
+		t.Fatal("ParseClaudeStreamUsage() ok = false, want true")
+	}
+	if detail.InputTokens != 23 {
+		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 23)
+	}
+	if detail.CacheReadTokens != 23 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 23)
+	}
+	if detail.CachedTokens != 23 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 23)
+	}
+}
+
+func TestClaudeStreamUsageAccumulatorCombinesStartAndDelta(t *testing.T) {
+	var acc ClaudeStreamUsageAccumulator
+	start, ok := ParseClaudeStreamUsage([]byte(`data: {"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":0,"cached_tokens":40,"cache_creation_input_tokens":3}}}`))
+	if !ok {
+		t.Fatal("message_start usage not parsed")
+	}
+	delta, ok := ParseClaudeStreamUsage([]byte(`data: {"type":"message_delta","usage":{"output_tokens":17}}`))
+	if !ok {
+		t.Fatal("message_delta usage not parsed")
+	}
+	acc.Add(start)
+	acc.Add(delta)
+
+	detail, ok := acc.Detail()
+	if !ok {
+		t.Fatal("accumulator detail ok = false, want true")
+	}
+	if detail.InputTokens != 100 {
+		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 100)
+	}
+	if detail.OutputTokens != 17 {
+		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 17)
+	}
+	if detail.CacheReadTokens != 40 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 40)
+	}
+	if detail.CacheCreationTokens != 3 {
+		t.Fatalf("cache creation tokens = %d, want %d", detail.CacheCreationTokens, 3)
+	}
+	if detail.TotalTokens != 160 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 160)
+	}
+}
+
+func TestParseGeminiUsageMapsCachedContentToCacheReadTokens(t *testing.T) {
+	data := []byte(`{"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":5,"totalTokenCount":105,"cachedContentTokenCount":40}}`)
+	detail := ParseGeminiUsage(data)
+	if detail.InputTokens != 100 {
+		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 100)
+	}
+	if detail.CachedTokens != 40 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 40)
+	}
+	if detail.CacheReadTokens != 40 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 40)
+	}
+	if detail.TotalTokens != 105 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 105)
+	}
+}
+
+func TestParseGeminiStreamUsageMapsCachedContentToCacheReadTokens(t *testing.T) {
+	line := []byte(`data: {"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":5,"totalTokenCount":105,"cachedContentTokenCount":40}}`)
+	detail, ok := ParseGeminiStreamUsage(line)
+	if !ok {
+		t.Fatal("ParseGeminiStreamUsage() ok = false, want true")
+	}
+	if detail.CachedTokens != 40 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 40)
+	}
+	if detail.CacheReadTokens != 40 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 40)
+	}
+}
+
+func TestParseAntigravityUsageMapsNestedCachedContentToCacheReadTokens(t *testing.T) {
+	data := []byte(`{"response":{"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":5,"totalTokenCount":105,"cachedContentTokenCount":40}}}`)
+	detail := ParseAntigravityUsage(data)
+	if detail.CachedTokens != 40 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 40)
+	}
+	if detail.CacheReadTokens != 40 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 40)
 	}
 }
 

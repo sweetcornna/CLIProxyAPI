@@ -105,17 +105,151 @@ func (h *Handler) deleteFromStringList(c *gin.Context, target *[]string, after f
 }
 
 // api-keys
+const defaultAPIKeyGroupName = "default"
+
 func (h *Handler) GetAPIKeys(c *gin.Context) { c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys}) }
 func (h *Handler) PutAPIKeys(c *gin.Context) {
 	h.putStringList(c, func(v []string) {
 		h.cfg.APIKeys = append([]string(nil), v...)
-	}, nil)
+	}, func() {
+		ensureAPIKeysHaveGroupBindings(h.cfg)
+	})
 }
 func (h *Handler) PatchAPIKeys(c *gin.Context) {
-	h.patchStringList(c, &h.cfg.APIKeys, func() {})
+	var body struct {
+		Old   *string `json:"old"`
+		New   *string `json:"new"`
+		Index *int    `json:"index"`
+		Value *string `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	if body.Index != nil && body.Value != nil && *body.Index >= 0 && *body.Index < len(h.cfg.APIKeys) {
+		oldValue := h.cfg.APIKeys[*body.Index]
+		h.cfg.APIKeys[*body.Index] = *body.Value
+		renameAPIKeyGroupBinding(h.cfg, oldValue, *body.Value)
+		h.persist(c)
+		return
+	}
+	if body.Old != nil && body.New != nil {
+		for i := range h.cfg.APIKeys {
+			if h.cfg.APIKeys[i] == *body.Old {
+				h.cfg.APIKeys[i] = *body.New
+				renameAPIKeyGroupBinding(h.cfg, *body.Old, *body.New)
+				h.persist(c)
+				return
+			}
+		}
+		h.cfg.APIKeys = append(h.cfg.APIKeys, *body.New)
+		ensureAPIKeysHaveGroupBindings(h.cfg)
+		h.persist(c)
+		return
+	}
+	c.JSON(400, gin.H{"error": "missing fields"})
 }
 func (h *Handler) DeleteAPIKeys(c *gin.Context) {
-	h.deleteFromStringList(c, &h.cfg.APIKeys, func() {})
+	h.deleteFromStringList(c, &h.cfg.APIKeys, func() {
+		ensureAPIKeysHaveGroupBindings(h.cfg)
+	})
+}
+
+func ensureAPIKeysHaveGroupBindings(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	validKeys := make(map[string]struct{}, len(cfg.APIKeys))
+	for _, key := range cfg.APIKeys {
+		key = strings.TrimSpace(key)
+		if key != "" {
+			validKeys[key] = struct{}{}
+		}
+	}
+
+	boundKeys := make(map[string]struct{}, len(cfg.APIKeys))
+	for i := range cfg.Groups {
+		clean := make([]string, 0, len(cfg.Groups[i].APIKeys))
+		for _, key := range cfg.Groups[i].APIKeys {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			if _, ok := validKeys[key]; !ok {
+				continue
+			}
+			clean = append(clean, key)
+			boundKeys[key] = struct{}{}
+		}
+		cfg.Groups[i].APIKeys = clean
+	}
+
+	missing := make([]string, 0)
+	for _, key := range cfg.APIKeys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, ok := boundKeys[key]; ok {
+			continue
+		}
+		missing = append(missing, key)
+		boundKeys[key] = struct{}{}
+	}
+	if len(missing) > 0 {
+		defaultIndex := -1
+		for i := range cfg.Groups {
+			if cfg.Groups[i].Name == defaultAPIKeyGroupName {
+				defaultIndex = i
+				break
+			}
+		}
+		if defaultIndex >= 0 {
+			cfg.Groups[defaultIndex].APIKeys = append(cfg.Groups[defaultIndex].APIKeys, missing...)
+		} else {
+			cfg.Groups = append(cfg.Groups, config.GroupConfig{Name: defaultAPIKeyGroupName, APIKeys: missing})
+		}
+	}
+	cfg.SanitizeGroups()
+}
+
+func renameAPIKeyGroupBinding(cfg *config.Config, oldKey, newKey string) {
+	if cfg == nil {
+		return
+	}
+	oldKey = strings.TrimSpace(oldKey)
+	newKey = strings.TrimSpace(newKey)
+	if oldKey == "" || newKey == "" || oldKey == newKey {
+		ensureAPIKeysHaveGroupBindings(cfg)
+		return
+	}
+	owner := -1
+	for i := range cfg.Groups {
+		for _, key := range cfg.Groups[i].APIKeys {
+			if strings.TrimSpace(key) == oldKey {
+				owner = i
+				break
+			}
+		}
+		if owner >= 0 {
+			break
+		}
+	}
+	if owner >= 0 {
+		for i := range cfg.Groups {
+			clean := make([]string, 0, len(cfg.Groups[i].APIKeys))
+			for _, key := range cfg.Groups[i].APIKeys {
+				key = strings.TrimSpace(key)
+				if key == "" || key == oldKey || key == newKey {
+					continue
+				}
+				clean = append(clean, key)
+			}
+			cfg.Groups[i].APIKeys = clean
+		}
+		cfg.Groups[owner].APIKeys = append(cfg.Groups[owner].APIKeys, newKey)
+	}
+	ensureAPIKeysHaveGroupBindings(cfg)
 }
 
 // gemini-api-key: []GeminiKey
@@ -141,8 +275,14 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.GeminiKey = append([]config.GeminiKey(nil), arr...)
-	h.cfg.SanitizeGeminiKeys()
+	nextCfg := *h.cfg
+	nextCfg.GeminiKey = append([]config.GeminiKey(nil), arr...)
+	nextCfg.SanitizeGeminiKeys()
+	if errCoverage := validateNewConfigAPIKeyGroupCoverage(h.cfg, &nextCfg); errCoverage != nil {
+		c.JSON(400, gin.H{"error": errCoverage.Error()})
+		return
+	}
+	h.cfg.GeminiKey = nextCfg.GeminiKey
 	h.persistLocked(c)
 }
 func (h *Handler) PatchGeminiKey(c *gin.Context) {
@@ -212,8 +352,15 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
 	}
-	h.cfg.GeminiKey[targetIndex] = entry
-	h.cfg.SanitizeGeminiKeys()
+	nextCfg := *h.cfg
+	nextCfg.GeminiKey = append([]config.GeminiKey(nil), h.cfg.GeminiKey...)
+	nextCfg.GeminiKey[targetIndex] = entry
+	nextCfg.SanitizeGeminiKeys()
+	if errCoverage := validateNewConfigAPIKeyGroupCoverage(h.cfg, &nextCfg); errCoverage != nil {
+		c.JSON(400, gin.H{"error": errCoverage.Error()})
+		return
+	}
+	h.cfg.GeminiKey = nextCfg.GeminiKey
 	h.persistLocked(c)
 }
 
@@ -301,8 +448,14 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.ClaudeKey = arr
-	h.cfg.SanitizeClaudeKeys()
+	nextCfg := *h.cfg
+	nextCfg.ClaudeKey = append([]config.ClaudeKey(nil), arr...)
+	nextCfg.SanitizeClaudeKeys()
+	if errCoverage := validateNewConfigAPIKeyGroupCoverage(h.cfg, &nextCfg); errCoverage != nil {
+		c.JSON(400, gin.H{"error": errCoverage.Error()})
+		return
+	}
+	h.cfg.ClaudeKey = nextCfg.ClaudeKey
 	h.persistLocked(c)
 }
 func (h *Handler) PatchClaudeKey(c *gin.Context) {
@@ -372,8 +525,15 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 		entry.RebuildMidSystemMessage = *body.Value.RebuildMidSystemMessage
 	}
 	normalizeClaudeKey(&entry)
-	h.cfg.ClaudeKey[targetIndex] = entry
-	h.cfg.SanitizeClaudeKeys()
+	nextCfg := *h.cfg
+	nextCfg.ClaudeKey = append([]config.ClaudeKey(nil), h.cfg.ClaudeKey...)
+	nextCfg.ClaudeKey[targetIndex] = entry
+	nextCfg.SanitizeClaudeKeys()
+	if errCoverage := validateNewConfigAPIKeyGroupCoverage(h.cfg, &nextCfg); errCoverage != nil {
+		c.JSON(400, gin.H{"error": errCoverage.Error()})
+		return
+	}
+	h.cfg.ClaudeKey = nextCfg.ClaudeKey
 	h.persistLocked(c)
 }
 
@@ -460,8 +620,14 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.OpenAICompatibility = filtered
-	h.cfg.SanitizeOpenAICompatibility()
+	nextCfg := *h.cfg
+	nextCfg.OpenAICompatibility = append([]config.OpenAICompatibility(nil), filtered...)
+	nextCfg.SanitizeOpenAICompatibility()
+	if errCoverage := validateNewConfigAPIKeyGroupCoverage(h.cfg, &nextCfg); errCoverage != nil {
+		c.JSON(400, gin.H{"error": errCoverage.Error()})
+		return
+	}
+	h.cfg.OpenAICompatibility = nextCfg.OpenAICompatibility
 	h.persistLocked(c)
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
@@ -534,8 +700,15 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
 	}
 	normalizeOpenAICompatibilityEntry(&entry)
-	h.cfg.OpenAICompatibility[targetIndex] = entry
-	h.cfg.SanitizeOpenAICompatibility()
+	nextCfg := *h.cfg
+	nextCfg.OpenAICompatibility = append([]config.OpenAICompatibility(nil), h.cfg.OpenAICompatibility...)
+	nextCfg.OpenAICompatibility[targetIndex] = entry
+	nextCfg.SanitizeOpenAICompatibility()
+	if errCoverage := validateNewConfigAPIKeyGroupCoverage(h.cfg, &nextCfg); errCoverage != nil {
+		c.JSON(400, gin.H{"error": errCoverage.Error()})
+		return
+	}
+	h.cfg.OpenAICompatibility = nextCfg.OpenAICompatibility
 	h.persistLocked(c)
 }
 
@@ -597,8 +770,14 @@ func (h *Handler) PutVertexCompatKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.VertexCompatAPIKey = append([]config.VertexCompatKey(nil), arr...)
-	h.cfg.SanitizeVertexCompatKeys()
+	nextCfg := *h.cfg
+	nextCfg.VertexCompatAPIKey = append([]config.VertexCompatKey(nil), arr...)
+	nextCfg.SanitizeVertexCompatKeys()
+	if errCoverage := validateNewConfigAPIKeyGroupCoverage(h.cfg, &nextCfg); errCoverage != nil {
+		c.JSON(400, gin.H{"error": errCoverage.Error()})
+		return
+	}
+	h.cfg.VertexCompatAPIKey = nextCfg.VertexCompatAPIKey
 	h.persistLocked(c)
 }
 func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
@@ -680,8 +859,15 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
 	}
 	normalizeVertexCompatKey(&entry)
-	h.cfg.VertexCompatAPIKey[targetIndex] = entry
-	h.cfg.SanitizeVertexCompatKeys()
+	nextCfg := *h.cfg
+	nextCfg.VertexCompatAPIKey = append([]config.VertexCompatKey(nil), h.cfg.VertexCompatAPIKey...)
+	nextCfg.VertexCompatAPIKey[targetIndex] = entry
+	nextCfg.SanitizeVertexCompatKeys()
+	if errCoverage := validateNewConfigAPIKeyGroupCoverage(h.cfg, &nextCfg); errCoverage != nil {
+		c.JSON(400, gin.H{"error": errCoverage.Error()})
+		return
+	}
+	h.cfg.VertexCompatAPIKey = nextCfg.VertexCompatAPIKey
 	h.persistLocked(c)
 }
 
@@ -953,8 +1139,14 @@ func (h *Handler) PutCodexKeys(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.CodexKey = filtered
-	h.cfg.SanitizeCodexKeys()
+	nextCfg := *h.cfg
+	nextCfg.CodexKey = append([]config.CodexKey(nil), filtered...)
+	nextCfg.SanitizeCodexKeys()
+	if errCoverage := validateNewConfigAPIKeyGroupCoverage(h.cfg, &nextCfg); errCoverage != nil {
+		c.JSON(400, gin.H{"error": errCoverage.Error()})
+		return
+	}
+	h.cfg.CodexKey = nextCfg.CodexKey
 	h.persistLocked(c)
 }
 func (h *Handler) PatchCodexKey(c *gin.Context) {
@@ -1027,8 +1219,15 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
 	}
 	normalizeCodexKey(&entry)
-	h.cfg.CodexKey[targetIndex] = entry
-	h.cfg.SanitizeCodexKeys()
+	nextCfg := *h.cfg
+	nextCfg.CodexKey = append([]config.CodexKey(nil), h.cfg.CodexKey...)
+	nextCfg.CodexKey[targetIndex] = entry
+	nextCfg.SanitizeCodexKeys()
+	if errCoverage := validateNewConfigAPIKeyGroupCoverage(h.cfg, &nextCfg); errCoverage != nil {
+		c.JSON(400, gin.H{"error": errCoverage.Error()})
+		return
+	}
+	h.cfg.CodexKey = nextCfg.CodexKey
 	h.persistLocked(c)
 }
 

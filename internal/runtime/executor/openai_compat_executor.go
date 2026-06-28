@@ -22,6 +22,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -31,6 +32,11 @@ const (
 	openAICompatImagesEditsPath             = "/images/edits"
 	openAICompatDefaultImageEndpoint        = openAICompatImagesGenerationsPath
 	openAICompatMultipartMemory       int64 = 32 << 20
+)
+
+const (
+	openAICompatClaudeCodeTodoGuardMarker = "<cli-proxy-claude-code-todo-guard>"
+	openAICompatClaudeCodeTodoGuardText   = openAICompatClaudeCodeTodoGuardMarker + "\nWhen using Claude Code todo or task tracking tools, keep the visible task list consistent. Do not send final or summary text while any item remains in_progress. Before finishing, asking the user to choose, or reporting a blocker, update the todo list so completed work is completed and deferred work is pending/open; leave an item in_progress only when active work will continue in the same turn.\n</cli-proxy-claude-code-todo-guard>"
 )
 
 // OpenAICompatExecutor implements a stateless executor for OpenAI-compatible providers.
@@ -127,6 +133,15 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			translated = updated
 		}
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
+		translated = applyOpenAICompactModelMapping(translated, auth, baseModel)
+	}
+	promptCacheKey := ""
+	if opts.Alt != "responses/compact" {
+		translated, promptCacheKey, err = applyOpenAICompatClaudeCodePromptCache(ctx, from, req, opts, baseModel, translated)
+		if err != nil {
+			return resp, err
+		}
+		translated = applyOpenAICompatClaudeCodeTodoGuard(from, baseModel, translated)
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
@@ -136,6 +151,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if promptCacheKey != "" {
+		httpReq.Header.Set("Session_id", promptCacheKey)
+	}
 	if apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
@@ -327,6 +345,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	promptCacheKey := ""
+	translated, promptCacheKey, err = applyOpenAICompatClaudeCodePromptCache(ctx, from, req, opts, baseModel, translated)
+	if err != nil {
+		return nil, err
+	}
+	translated = applyOpenAICompatClaudeCodeTodoGuard(from, baseModel, translated)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
@@ -335,6 +359,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if promptCacheKey != "" {
+		httpReq.Header.Set("Session_id", promptCacheKey)
+	}
 	if apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
@@ -433,6 +460,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
+			errScan = normalizeStreamReadError("openai compat", errScan)
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
@@ -456,6 +484,112 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		reporter.EnsurePublished(ctx)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func applyOpenAICompatClaudeCodePromptCache(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, body []byte) ([]byte, string, error) {
+	if len(body) == 0 || !sourceFormatEqual(from, sdktranslator.FormatClaude) {
+		return body, "", nil
+	}
+	model := strings.TrimSpace(baseModel)
+	if model == "" {
+		model = strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	}
+	if !openAICompatShouldAutoInjectClaudeCodePromptCache(model) {
+		return body, "", nil
+	}
+	if existing := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()); existing != "" {
+		return body, existing, nil
+	}
+	cache, ok, err := helps.ClaudeCodePromptCache(ctx, model, req.Payload, opts.Headers)
+	if err != nil || !ok || strings.TrimSpace(cache.ID) == "" {
+		return body, "", err
+	}
+	updated, err := sjson.SetBytes(body, "prompt_cache_key", cache.ID)
+	if err != nil {
+		return body, "", err
+	}
+	return updated, cache.ID, nil
+}
+
+func openAICompatShouldAutoInjectClaudeCodePromptCache(model string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(model))
+	if trimmed == "" {
+		return false
+	}
+	if idx := strings.LastIndex(trimmed, "/"); idx >= 0 && idx < len(trimmed)-1 {
+		trimmed = strings.TrimSpace(trimmed[idx+1:])
+	}
+	return strings.HasPrefix(trimmed, "gpt-5") ||
+		strings.HasPrefix(trimmed, "gpt-4.1") ||
+		strings.HasPrefix(trimmed, "gpt-4.5") ||
+		strings.HasPrefix(trimmed, "gpt-4o") ||
+		strings.HasPrefix(trimmed, "chatgpt-4o") ||
+		strings.HasPrefix(trimmed, "o1") ||
+		strings.HasPrefix(trimmed, "o3") ||
+		strings.HasPrefix(trimmed, "o4") ||
+		strings.HasPrefix(trimmed, "grok") ||
+		strings.HasPrefix(trimmed, "xai") ||
+		strings.HasPrefix(trimmed, "kimi") ||
+		strings.HasPrefix(trimmed, "moonshot") ||
+		strings.HasPrefix(trimmed, "deepseek") ||
+		strings.HasPrefix(trimmed, "qwen") ||
+		strings.HasPrefix(trimmed, "glm") ||
+		strings.HasPrefix(trimmed, "minimax") ||
+		strings.HasPrefix(trimmed, "codex") ||
+		strings.Contains(trimmed, "-codex") ||
+		strings.Contains(trimmed, "codex-")
+}
+
+func applyOpenAICompatClaudeCodeTodoGuard(from sdktranslator.Format, baseModel string, body []byte) []byte {
+	if len(body) == 0 || !sourceFormatEqual(from, sdktranslator.FormatClaude) {
+		return body
+	}
+	model := strings.TrimSpace(baseModel)
+	if model == "" {
+		model = strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	}
+	if !openAICompatShouldAutoInjectClaudeCodePromptCache(model) {
+		return body
+	}
+	if bytes.Contains(body, []byte(openAICompatClaudeCodeTodoGuardMarker)) {
+		return body
+	}
+	if messages := gjson.GetBytes(body, "messages"); !messages.IsArray() || len(messages.Array()) == 0 {
+		return body
+	}
+
+	var reqBody map[string]any
+	if err := json.Unmarshal(body, &reqBody); err != nil {
+		return body
+	}
+	messages, ok := reqBody["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		return body
+	}
+
+	insertAt := 0
+	for insertAt < len(messages) {
+		message, ok := messages[insertAt].(map[string]any)
+		if !ok || strings.TrimSpace(fmt.Sprint(message["role"])) != "developer" {
+			break
+		}
+		insertAt++
+	}
+
+	guard := map[string]any{
+		"role":    "developer",
+		"content": openAICompatClaudeCodeTodoGuardText,
+	}
+	messages = append(messages, nil)
+	copy(messages[insertAt+1:], messages[insertAt:])
+	messages[insertAt] = guard
+	reqBody["messages"] = messages
+
+	updated, err := json.Marshal(reqBody)
+	if err != nil {
+		return body
+	}
+	return updated
 }
 
 func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (_ *cliproxyexecutor.StreamResult, err error) {

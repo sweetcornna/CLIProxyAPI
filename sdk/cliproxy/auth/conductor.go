@@ -2406,6 +2406,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		m.seedOutOfGroupTried(grp, tried)
 		fallbackGroups = m.resolveFallbackGroups(grp)
 	}
+	invalidRequestFallbackUsed := false
+executionLoop:
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -2481,6 +2483,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					if m.admitInvalidRequestFallback(grp, tried, &invalidRequestFallbackUsed) {
+						lastErr = errExec
+						continue executionLoop
+					}
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -2522,6 +2528,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		m.seedOutOfGroupTried(grp, tried)
 		fallbackGroups = m.resolveFallbackGroups(grp)
 	}
+	invalidRequestFallbackUsed := false
+executionLoop:
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -2597,6 +2605,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					if m.admitInvalidRequestFallback(grp, tried, &invalidRequestFallbackUsed) {
+						lastErr = errExec
+						continue executionLoop
+					}
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -2638,6 +2650,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		m.seedOutOfGroupTried(grp, tried)
 		fallbackGroups = m.resolveFallbackGroups(grp)
 	}
+	invalidRequestFallbackUsed := false
+executionLoop:
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -2696,6 +2710,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, errCtx
 			}
 			if isRequestInvalidError(errStream) {
+				if m.admitInvalidRequestFallback(grp, tried, &invalidRequestFallbackUsed) {
+					lastErr = errStream
+					continue executionLoop
+				}
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -4835,6 +4853,14 @@ func (m *Manager) homeRuntimeAuthByID(sessionID string, authID string) (*Auth, P
 	return auth.Clone(), executor, providerKey, true
 }
 
+func (m *Manager) homeAuthAllowedForRequestGroup(auth *Auth, opts cliproxyexecutor.Options) bool {
+	grp := m.groupFromMetadata(opts.Metadata)
+	if !groupCredentialNarrowing(grp) {
+		return true
+	}
+	return authMatchesGroup(auth, grp)
+}
+
 func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if m == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -4849,7 +4875,9 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 			_, alreadyTried := tried[pinnedAuthID]
 			if !alreadyTried {
 				if auth, executor, providerKey, ok := m.homeRuntimeAuthByID(executionSessionID, pinnedAuthID); ok {
-					return auth, executor, providerKey, nil
+					if m.homeAuthAllowedForRequestGroup(auth, opts) {
+						return auth, executor, providerKey, nil
+					}
 				}
 			}
 		}
@@ -4913,6 +4941,9 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 	if strings.TrimSpace(auth.ID) == "" {
 		return nil, nil, "", &Error{Code: "invalid_auth", Message: "home returned auth without id", HTTPStatus: http.StatusBadGateway}
 	}
+	if !m.homeAuthAllowedForRequestGroup(&auth, opts) {
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "home returned auth outside requested group", HTTPStatus: http.StatusServiceUnavailable}
+	}
 	if homeAuthAlreadyTried(tried, auth.ID) {
 		return nil, nil, "", repeatedHomeAuthError()
 	}
@@ -4974,10 +5005,15 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 		return nil, nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	grp := m.groupFromMetadata(opts.Metadata)
+	narrowByGroup := groupCredentialNarrowing(grp)
 	var candidates []creditsCandidateEntry
 	m.mu.RLock()
 	for _, auth := range m.auths {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		if narrowByGroup && !authMatchesGroup(auth, grp) {
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {

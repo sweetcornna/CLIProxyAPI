@@ -18,6 +18,7 @@ import (
 
 // aiAPIPrefixes defines path prefixes for AI API requests that should have request ID tracking.
 var aiAPIPrefixes = []string{
+	"/v1/models",
 	"/v1/chat/completions",
 	"/v1/completions",
 	"/v1/images",
@@ -52,10 +53,14 @@ func GinLogrusLogger() gin.HandlerFunc {
 		// Only generate request ID for AI API paths
 		var requestID string
 		if isAIAPIPath(path) {
-			requestID = GenerateRequestID()
+			requestID = requestIDFromHeaders(c)
+			if requestID == "" {
+				requestID = GenerateRequestID()
+			}
 			SetGinRequestID(c, requestID)
 			ctx := WithRequestID(c.Request.Context(), requestID)
 			c.Request = c.Request.WithContext(ctx)
+			c.Writer.Header().Set("X-Request-Id", requestID)
 		}
 
 		c.Next()
@@ -102,6 +107,36 @@ func GinLogrusLogger() gin.HandlerFunc {
 			entry.Info(logLine)
 		}
 	}
+}
+
+func requestIDFromHeaders(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	for _, header := range []string{"X-Request-Id", "X-Correlation-Id"} {
+		if requestID := sanitizeInboundRequestID(c.GetHeader(header)); requestID != "" {
+			return requestID
+		}
+	}
+	return ""
+}
+
+func sanitizeInboundRequestID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range raw {
+		if r < 0x21 || r == 0x7f || r > 0x7e {
+			continue
+		}
+		b.WriteRune(r)
+		if b.Len() >= 128 {
+			break
+		}
+	}
+	return b.String()
 }
 
 // isAIAPIPath checks if the given path is an AI API endpoint that should have request ID tracking.

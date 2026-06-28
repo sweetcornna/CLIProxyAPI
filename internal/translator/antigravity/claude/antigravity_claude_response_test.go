@@ -60,6 +60,36 @@ func TestConvertAntigravityResponseToClaudeNonStream_WebSearchGroundingRequiresN
 	}
 }
 
+func TestConvertAntigravityResponseToClaudeNonStream_CachedContentUsesClaudeInputSemantics(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-3-flash-agent","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	translatedRequestJSON := []byte(`{"model":"gemini-3-flash-agent","request":{"contents":[]}}`)
+	responseJSON := []byte(`{
+		"response": {
+			"modelVersion": "gemini-3-flash-agent",
+			"responseId": "resp-cache",
+			"candidates": [{
+				"content": {"parts": [{"text": "ok"}]},
+				"finishReason": "STOP"
+			}],
+			"usageMetadata": {
+				"promptTokenCount": 100,
+				"candidatesTokenCount": 5,
+				"cachedContentTokenCount": 40,
+				"totalTokenCount": 105
+			}
+		}
+	}`)
+
+	output := ConvertAntigravityResponseToClaudeNonStream(context.Background(), "gemini-3-flash-agent", requestJSON, translatedRequestJSON, responseJSON, nil)
+
+	if got := gjson.GetBytes(output, "usage.input_tokens").Int(); got != 60 {
+		t.Fatalf("usage.input_tokens = %d, want 60: %s", got, output)
+	}
+	if got := gjson.GetBytes(output, "usage.cache_read_input_tokens").Int(); got != 40 {
+		t.Fatalf("usage.cache_read_input_tokens = %d, want 40: %s", got, output)
+	}
+}
+
 func TestConvertAntigravityResponseToClaudeStream_WebSearchGrounding(t *testing.T) {
 	requestJSON := []byte(`{
 		"model": "gemini-3.1-flash-lite",
@@ -177,6 +207,39 @@ func TestConvertAntigravityResponseToClaudeStream_WebSearchMessageStartOutputTok
 
 	if got := gjson.Get(messageStart, "message.usage.output_tokens").Int(); got != 0 {
 		t.Fatalf("message_start output_tokens = %d, want 0: %s", got, messageStart)
+	}
+}
+
+func TestConvertAntigravityResponseToClaudeStream_CPAUsageCachedContentUsesClaudeInputSemantics(t *testing.T) {
+	requestJSON := []byte(`{
+		"model": "gemini-3.1-flash-lite",
+		"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+	}`)
+	translatedRequestJSON := []byte(`{"model":"gemini-3.1-flash-lite","request":{"contents":[]}}`)
+	responseJSON := []byte(`{
+		"response": {
+			"modelVersion": "gemini-3.1-flash-lite",
+			"responseId": "resp-cpa-cache",
+			"candidates": [{
+				"content": {"parts": [{"text": "ok"}]}
+			}],
+			"cpaUsageMetadata": {
+				"promptTokenCount": 100,
+				"candidatesTokenCount": 5,
+				"cachedContentTokenCount": 40
+			}
+		}
+	}`)
+
+	var param any
+	output := bytes.Join(ConvertAntigravityResponseToClaude(context.Background(), "gemini-3.1-flash-lite", requestJSON, translatedRequestJSON, responseJSON, &param), nil)
+	messageStart := sseDataForEvent(t, string(output), "message_start")
+
+	if got := gjson.Get(messageStart, "message.usage.input_tokens").Int(); got != 60 {
+		t.Fatalf("message_start input_tokens = %d, want 60: %s", got, messageStart)
+	}
+	if got := gjson.Get(messageStart, "message.usage.cache_read_input_tokens").Int(); got != 40 {
+		t.Fatalf("message_start cache_read_input_tokens = %d, want 40: %s", got, messageStart)
 	}
 }
 

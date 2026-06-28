@@ -201,12 +201,15 @@ routing:
 #   gpt-5.4: 1050000
 
 # groups bind inbound api-keys to a credential selection + per-group model-mapping
-# override + optional fallback group. Config-only (no DB / UI / billing / quotas).
+# override + optional fallback groups. Config-only (no DB / UI / billing / quotas).
 # Use groups to give different keys different mappings, e.g. a long-context lane.
 # groups:
 #   - name: "default"
 #     api-keys: ["REPLACE_WITH_SK_KEY_cornna"]
 #     providers: ["codex"]
+#     # deny-credentials: true  # keep the inbound key group but match no upstream credentials
+#     # models: ["gpt-5.5", "gpt-5.4-*"]  # optional: restrict client-visible models by id/glob
+#     # deny-models: true  # keep the inbound key group but allow no models
 #     routing: { strategy: "round-robin" }   # inherits global model-mapping
 #   - name: "longctx"
 #     api-keys: ["REPLACE_WITH_SK_KEY_1m"]
@@ -215,6 +218,7 @@ routing:
 #       rules:
 #         - { pattern: "claude-*", target: "gpt-5.4" }  # genuine 1M on Codex
 #     fallback-group: "default"
+#     fallback-group-on-invalid-request: "default" # optional: one retry after request-shape invalid_request errors
 
 # claude-compat injects a minimal, scoped sub-agent dispatch nudge (as a
 # <system-reminder> in the first user message) ONLY when a Claude Code request is
@@ -281,6 +285,9 @@ nonstream-keepalive-interval: 0
 #     prefix: "test" # optional: require calls like "test/gpt-5-codex" to target this credential
 #     disable-cooling: false # optional: per-auth override for auth/model cooldown scheduling
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
+#     openai-compact-supported: true # optional: true/false if this credential is known to support /responses/compact; omit to keep unknown
+#     openai-compact-model-mapping: # optional: only rewrite model for /responses/compact
+#       gpt-5.4: "gpt-5.4-openai-compact"
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
@@ -361,11 +368,17 @@ nonstream-keepalive-interval: 0
 #     prefix: "test" # optional: require calls like "test/kimi-k2" to target this provider's credentials
 #     base-url: "https://openrouter.ai/api/v1" # The base URL of the provider.
 #     disable-cooling: false # optional: per-provider override for auth/model cooldown scheduling
+#     openai-compact-supported: false # optional provider default for /responses/compact support; omit to keep unknown
+#     openai-compact-model-mapping: # optional provider default for /responses/compact model rewrite
+#       gpt-5.4: "gpt-5.4-openai-compact"
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     api-key-entries:
 #       - api-key: "sk-or-v1-...b780"
 #         proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#         openai-compact-supported: true # optional per-key override
+#         openai-compact-model-mapping: # optional per-key override
+#           gpt-5.4: "gpt-5.4-openai-compact"
 #         # proxy-url: "direct" # optional: explicit direct connect for this credential
 #       - api-key: "sk-or-v1-...b781" # without proxy-url
 #     models: # The models supported by the provider.

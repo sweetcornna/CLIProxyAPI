@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -463,7 +464,7 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 			Type:          "openai",
 			DisplayName:   "GPT 5.5",
 			Description:   "Frontier model for complex coding, research, and real-world work.",
-			ContextLength: 272000,
+			ContextLength: 400000,
 			Thinking:      &registry.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}},
 		},
 		{
@@ -530,6 +531,12 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 	if _, ok := gpt55["minimal_client_version"]; !ok {
 		t.Fatal("expected minimal_client_version in codex catalog")
 	}
+	if got, _ := gpt55["context_window"].(float64); got != 400000 {
+		t.Fatalf("gpt-5.5 context_window = %v, want 400000 from registry metadata", got)
+	}
+	if got, _ := gpt55["max_context_window"].(float64); got != 400000 {
+		t.Fatalf("gpt-5.5 max_context_window = %v, want 400000 from registry metadata", got)
+	}
 	serviceTiers, ok := gpt55["service_tiers"].([]any)
 	if !ok || len(serviceTiers) != 1 {
 		t.Fatalf("expected gpt-5.5 priority service tier, got %#v", gpt55["service_tiers"])
@@ -594,6 +601,270 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 		if !found {
 			t.Fatalf("expected hidden model %s in codex catalog", slug)
 		}
+	}
+}
+
+func TestModelsWithClientVersionHonorsGroupCredentialScope(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient("codex-team-a.json", "codex", []*registry.ModelInfo{
+		{
+			ID:            "team-a-codex-model",
+			Object:        "model",
+			OwnedBy:       "team-a",
+			Type:          "openai",
+			DisplayName:   "Team A Codex Model",
+			ContextLength: 200000,
+		},
+	})
+	modelRegistry.RegisterClient("codex-team-b.json", "codex", []*registry.ModelInfo{
+		{
+			ID:            "team-b-codex-model",
+			Object:        "model",
+			OwnedBy:       "team-b",
+			Type:          "openai",
+			DisplayName:   "Team B Codex Model",
+			ContextLength: 200000,
+		},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient("codex-team-a.json")
+		modelRegistry.UnregisterClient("codex-team-b.json")
+	})
+
+	server := newTestServer(t)
+	server.cfg.APIKeys = []string{"sk-team-a", "sk-team-b"}
+	server.cfg.Groups = []proxyconfig.GroupConfig{
+		{Name: "team-a", APIKeys: []string{"sk-team-a"}, Providers: []string{"codex"}, Credentials: []string{"codex-team-a.json"}},
+		{Name: "team-b", APIKeys: []string{"sk-team-b"}, Providers: []string{"codex"}, Credentials: []string{"codex-team-b.json"}},
+	}
+	server.cfg.SanitizeGroups()
+	server.handlers.UpdateClients(effectiveSDKConfig(server.cfg))
+	server.applyAccessConfig(nil, server.cfg)
+
+	if _, err := server.handlers.AuthManager.Register(context.Background(), &auth.Auth{
+		ID:       "codex-team-a.json",
+		Provider: "codex",
+		Label:    "codex-team-a.json",
+	}); err != nil {
+		t.Fatalf("register team-a auth: %v", err)
+	}
+	if _, err := server.handlers.AuthManager.Register(context.Background(), &auth.Auth{
+		ID:       "codex-team-b.json",
+		Provider: "codex",
+		Label:    "codex-team-b.json",
+	}); err != nil {
+		t.Fatalf("register team-b auth: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version", nil)
+	req.Header.Set("Authorization", "Bearer sk-team-a")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var resp struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response JSON: %v; body=%s", err, rr.Body.String())
+	}
+
+	slugs := make(map[string]struct{}, len(resp.Models))
+	for _, model := range resp.Models {
+		if slug, _ := model["slug"].(string); slug != "" {
+			slugs[slug] = struct{}{}
+		}
+	}
+	if _, ok := slugs["team-a-codex-model"]; !ok {
+		t.Fatalf("expected team-a model in scoped codex catalog, got %v", slugs)
+	}
+	if _, ok := slugs["team-b-codex-model"]; ok {
+		t.Fatalf("did not expect team-b model in team-a scoped codex catalog, got %v", slugs)
+	}
+}
+
+func TestModelsWithClientVersionHidesCatalogForUngroupedAPIKey(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient("codex-grouped-only.json", "codex", []*registry.ModelInfo{
+		{
+			ID:            "grouped-only-codex-model",
+			Object:        "model",
+			OwnedBy:       "team",
+			Type:          "openai",
+			DisplayName:   "Grouped Only Codex Model",
+			ContextLength: 200000,
+		},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient("codex-grouped-only.json")
+	})
+
+	server := newTestServer(t)
+	server.cfg.APIKeys = []string{"sk-unbound", "sk-team"}
+	server.cfg.Groups = []proxyconfig.GroupConfig{
+		{Name: "team", APIKeys: []string{"sk-team"}, Providers: []string{"codex"}, Credentials: []string{"codex-grouped-only.json"}},
+	}
+	server.cfg.SanitizeGroups()
+	server.handlers.UpdateClients(effectiveSDKConfig(server.cfg))
+	server.applyAccessConfig(nil, server.cfg)
+
+	if _, err := server.handlers.AuthManager.Register(context.Background(), &auth.Auth{
+		ID:       "codex-grouped-only.json",
+		Provider: "codex",
+		Label:    "codex-grouped-only.json",
+	}); err != nil {
+		t.Fatalf("register grouped auth: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version", nil)
+	req.Header.Set("Authorization", "Bearer sk-unbound")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var resp struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response JSON: %v; body=%s", err, rr.Body.String())
+	}
+	if len(resp.Models) != 0 {
+		t.Fatalf("ungrouped api key catalog returned %d models, want 0", len(resp.Models))
+	}
+}
+
+func TestModelsWithClientVersionHonorsDenyCredentialsGroup(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient("codex-denied.json", "codex", []*registry.ModelInfo{
+		{
+			ID:            "denied-codex-model",
+			Object:        "model",
+			OwnedBy:       "denied",
+			Type:          "openai",
+			DisplayName:   "Denied Codex Model",
+			ContextLength: 200000,
+		},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient("codex-denied.json")
+	})
+
+	server := newTestServer(t)
+	server.cfg.APIKeys = []string{"sk-denied"}
+	server.cfg.Groups = []proxyconfig.GroupConfig{
+		{Name: "denied", APIKeys: []string{"sk-denied"}, DenyCredentials: true},
+	}
+	server.cfg.SanitizeGroups()
+	server.handlers.UpdateClients(effectiveSDKConfig(server.cfg))
+	server.applyAccessConfig(nil, server.cfg)
+
+	if _, err := server.handlers.AuthManager.Register(context.Background(), &auth.Auth{
+		ID:       "codex-denied.json",
+		Provider: "codex",
+		Label:    "codex-denied.json",
+	}); err != nil {
+		t.Fatalf("register denied auth: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version", nil)
+	req.Header.Set("Authorization", "Bearer sk-denied")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var resp struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response JSON: %v; body=%s", err, rr.Body.String())
+	}
+	if len(resp.Models) != 0 {
+		t.Fatalf("deny-credentials catalog returned %d models, want 0", len(resp.Models))
+	}
+}
+
+func TestModelsWithClientVersionHonorsGroupModelScope(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient("codex-model-scope.json", "codex", []*registry.ModelInfo{
+		{
+			ID:            "team-visible-model",
+			Object:        "model",
+			OwnedBy:       "team",
+			Type:          "openai",
+			DisplayName:   "Team Visible Model",
+			ContextLength: 200000,
+		},
+		{
+			ID:            "team-hidden-model",
+			Object:        "model",
+			OwnedBy:       "team",
+			Type:          "openai",
+			DisplayName:   "Team Hidden Model",
+			ContextLength: 200000,
+		},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient("codex-model-scope.json")
+	})
+
+	server := newTestServer(t)
+	server.cfg.APIKeys = []string{"sk-team"}
+	server.cfg.Groups = []proxyconfig.GroupConfig{
+		{
+			Name:        "team",
+			APIKeys:     []string{"sk-team"},
+			Providers:   []string{"codex"},
+			Credentials: []string{"codex-model-scope.json"},
+			Models:      []string{"team-visible-*"},
+		},
+	}
+	server.cfg.SanitizeGroups()
+	server.handlers.UpdateClients(effectiveSDKConfig(server.cfg))
+	server.applyAccessConfig(nil, server.cfg)
+
+	if _, err := server.handlers.AuthManager.Register(context.Background(), &auth.Auth{
+		ID:       "codex-model-scope.json",
+		Provider: "codex",
+		Label:    "codex-model-scope.json",
+	}); err != nil {
+		t.Fatalf("register scoped auth: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version", nil)
+	req.Header.Set("Authorization", "Bearer sk-team")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var resp struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response JSON: %v; body=%s", err, rr.Body.String())
+	}
+	slugs := make(map[string]struct{}, len(resp.Models))
+	for _, model := range resp.Models {
+		if slug, _ := model["slug"].(string); slug != "" {
+			slugs[slug] = struct{}{}
+		}
+	}
+	if _, ok := slugs["team-visible-model"]; !ok {
+		t.Fatalf("expected visible model in scoped codex catalog, got %v", slugs)
+	}
+	if _, ok := slugs["team-hidden-model"]; ok {
+		t.Fatalf("did not expect hidden model in scoped codex catalog, got %v", slugs)
 	}
 }
 

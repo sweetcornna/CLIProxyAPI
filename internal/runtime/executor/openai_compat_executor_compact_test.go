@@ -62,6 +62,74 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatExecutorCompactModelMappingOverridesUpstreamModel(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response.compaction","model":"gpt-5.4-openai-compact","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url":                     server.URL + "/v1",
+		"api_key":                      "test",
+		"openai_compact_model_mapping": `{"gpt-5.4":"gpt-5.4-openai-compact"}`,
+	}}
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Alt:          "responses/compact",
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-5.4-openai-compact" {
+		t.Fatalf("upstream model = %q, want %q; body=%s", got, "gpt-5.4-openai-compact", string(gotBody))
+	}
+}
+
+func TestOpenAICompatExecutorNonCompactIgnoresCompactModelMapping(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url":                     server.URL + "/v1",
+		"api_key":                      "test",
+		"openai_compact_model_mapping": `{"gpt-5.4":"gpt-5.4-openai-compact"}`,
+	}}
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Fatalf("path = %q, want %q", gotPath, "/v1/chat/completions")
+	}
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-5.4" {
+		t.Fatalf("upstream model = %q, want %q; body=%s", got, "gpt-5.4", string(gotBody))
+	}
+}
+
 func TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -103,6 +171,287 @@ func TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix(t *testing.T)
 	}
 	if got := gjson.GetBytes(gotBody, "reasoning_effort").String(); got != "low" {
 		t.Fatalf("reasoning_effort = %q, want %q; body=%s", got, "low", string(gotBody))
+	}
+}
+
+func TestOpenAICompatExecutorStreamClaudeCodeInjectsPromptCacheKeyForGPT5CompatModel(t *testing.T) {
+	var gotBody []byte
+	var gotSessionID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSessionID = r.Header.Get("Session_id")
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"metadata":{"user_id":"{\"device_id\":\"device-a\",\"account_uuid\":\"\",\"session_id\":\"compat-cache-session\"}"},
+		"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],
+		"stream":true
+	}`)
+
+	stream, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+	}
+
+	cacheKey := gjson.GetBytes(gotBody, "prompt_cache_key").String()
+	if cacheKey == "" {
+		t.Fatalf("prompt_cache_key missing from upstream body: %s", string(gotBody))
+	}
+	if gotSessionID != cacheKey {
+		t.Fatalf("Session_id = %q, want prompt_cache_key %q", gotSessionID, cacheKey)
+	}
+}
+
+func TestOpenAICompatExecutorClaudeCodeCacheControlAnchorStableAcrossGPT5CompatModels(t *testing.T) {
+	var gotBodies [][]byte
+	var gotSessionIDs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSessionIDs = append(gotSessionIDs, r.Header.Get("Session_id"))
+		body, _ := io.ReadAll(r.Body)
+		gotBodies = append(gotBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	firstPayload := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"system":[{"type":"text","text":"shared project instructions","cache_control":{"type":"ephemeral"}}],
+		"messages":[{"role":"user","content":[{"type":"text","text":"first task"}]}]
+	}`)
+	secondPayload := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"system":[{"type":"text","text":"shared project instructions","cache_control":{"type":"ephemeral"}}],
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"first task"}]},
+			{"role":"assistant","content":[{"type":"text","text":"ok"}]},
+			{"role":"user","content":[{"type":"text","text":"continue"}]}
+		]
+	}`)
+
+	for _, tc := range []struct {
+		model   string
+		payload []byte
+	}{
+		{model: "gpt-5.4", payload: firstPayload},
+		{model: "gpt-5.5", payload: secondPayload},
+	} {
+		_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+			Model:   tc.model,
+			Payload: tc.payload,
+		}, cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FromString("claude"),
+			Stream:       false,
+		})
+		if err != nil {
+			t.Fatalf("Execute(%s) error: %v", tc.model, err)
+		}
+	}
+
+	if len(gotBodies) != 2 {
+		t.Fatalf("captured %d upstream bodies, want 2", len(gotBodies))
+	}
+	firstKey := gjson.GetBytes(gotBodies[0], "prompt_cache_key").String()
+	secondKey := gjson.GetBytes(gotBodies[1], "prompt_cache_key").String()
+	if firstKey == "" {
+		t.Fatalf("first prompt_cache_key missing from upstream body: %s", string(gotBodies[0]))
+	}
+	if secondKey != firstKey {
+		t.Fatalf("cache_control anchor produced different prompt_cache_key across models: first=%q second=%q", firstKey, secondKey)
+	}
+	if gotSessionIDs[0] != firstKey || gotSessionIDs[1] != firstKey {
+		t.Fatalf("Session_id headers = %#v, want both %q", gotSessionIDs, firstKey)
+	}
+}
+
+func TestOpenAICompatExecutorClaudeCodeAddsTodoGuardForGPT5CompatModel(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"system":[{"type":"text","text":"project instructions","cache_control":{"type":"ephemeral"}}],
+		"messages":[{"role":"user","content":[{"type":"text","text":"first task"}]}]
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := gjson.GetBytes(gotBody, "messages.0.role").String(); got != "developer" {
+		t.Fatalf("messages.0.role = %q, want developer; body=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "messages.0.content").String(); !strings.Contains(got, "<cli-proxy-claude-code-todo-guard>") {
+		t.Fatalf("messages.0.content missing todo guard marker; body=%s", string(gotBody))
+	}
+}
+
+func TestOpenAICompatExecutorClaudeCodeInjectsPromptCacheKeyForGPT4OCompatModel(t *testing.T) {
+	var gotBody []byte
+	var gotSessionID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSessionID = r.Header.Get("Session_id")
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"metadata":{"user_id":"{\"session_id\":\"compat-cache-session-non-gpt5\"}"},
+		"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-4o",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	cacheKey := gjson.GetBytes(gotBody, "prompt_cache_key").String()
+	if cacheKey == "" {
+		t.Fatalf("prompt_cache_key missing from upstream body: %s", string(gotBody))
+	}
+	if gotSessionID != cacheKey {
+		t.Fatalf("Session_id = %q, want prompt_cache_key %q", gotSessionID, cacheKey)
+	}
+}
+
+func TestOpenAICompatExecutorClaudeCodeInjectsPromptCacheKeyForGrokCompatModel(t *testing.T) {
+	var gotBody []byte
+	var gotSessionID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSessionID = r.Header.Get("Session_id")
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"metadata":{"user_id":"{\"session_id\":\"compat-cache-session-grok\"}"},
+		"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.3",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	cacheKey := gjson.GetBytes(gotBody, "prompt_cache_key").String()
+	if cacheKey == "" {
+		t.Fatalf("prompt_cache_key missing from upstream body: %s", string(gotBody))
+	}
+	if gotSessionID != cacheKey {
+		t.Fatalf("Session_id = %q, want prompt_cache_key %q", gotSessionID, cacheKey)
+	}
+}
+
+func TestOpenAICompatExecutorClaudeCodeDoesNotInjectPromptCacheKeyForUnknownCompatModel(t *testing.T) {
+	var gotBody []byte
+	var gotSessionID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSessionID = r.Header.Get("Session_id")
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"metadata":{"user_id":"{\"session_id\":\"compat-cache-session-unknown\"}"},
+		"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if gjson.GetBytes(gotBody, "prompt_cache_key").Exists() {
+		t.Fatalf("prompt_cache_key should not be injected for unknown compat model: %s", string(gotBody))
+	}
+	if gotSessionID != "" {
+		t.Fatalf("Session_id = %q, want empty", gotSessionID)
 	}
 }
 

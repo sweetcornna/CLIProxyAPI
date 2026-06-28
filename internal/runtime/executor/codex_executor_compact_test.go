@@ -77,3 +77,36 @@ func TestCodexExecutorCompactAddsDefaultInstructions(t *testing.T) {
 		})
 	}
 }
+
+func TestCodexExecutorCompactModelMappingOverridesUpstreamModel(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response.compaction","model":"gpt-5.4-openai-compact","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url":                     server.URL,
+		"api_key":                      "test",
+		"openai_compact_model_mapping": `{"gpt-5.4":"gpt-5.4-openai-compact"}`,
+	}}
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Alt:          "responses/compact",
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-5.4-openai-compact" {
+		t.Fatalf("upstream model = %q, want %q; body=%s", got, "gpt-5.4-openai-compact", string(gotBody))
+	}
+}

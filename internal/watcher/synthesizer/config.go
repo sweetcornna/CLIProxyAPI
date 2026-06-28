@@ -1,6 +1,7 @@
 package synthesizer
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -187,6 +188,8 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		if ck.Websockets {
 			attrs["websockets"] = "true"
 		}
+		addOpenAICompactSupportAttr(attrs, ck.OpenAICompactSupported)
+		addOpenAICompactModelMappingAttr(attrs, ck.OpenAICompactModelMapping)
 		if hash := diff.ComputeCodexModelsHash(ck.Models); hash != "" {
 			attrs["models_hash"] = hash
 		}
@@ -255,6 +258,16 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
 			}
+			compactSupported := compat.OpenAICompactSupported
+			if entry.OpenAICompactSupported != nil {
+				compactSupported = entry.OpenAICompactSupported
+			}
+			addOpenAICompactSupportAttr(attrs, compactSupported)
+			compactModelMapping := compat.OpenAICompactModelMapping
+			if len(entry.OpenAICompactModelMapping) > 0 {
+				compactModelMapping = entry.OpenAICompactModelMapping
+			}
+			addOpenAICompactModelMappingAttr(attrs, compactModelMapping)
 			if key != "" {
 				attrs["api_key"] = key
 			}
@@ -297,6 +310,8 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
 			}
+			addOpenAICompactSupportAttr(attrs, compat.OpenAICompactSupported)
+			addOpenAICompactModelMappingAttr(attrs, compat.OpenAICompactModelMapping)
 			if hash := diff.ComputeOpenAICompatModelsHash(compat.Models); hash != "" {
 				attrs["models_hash"] = hash
 			}
@@ -368,4 +383,34 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		out = append(out, a)
 	}
 	return out
+}
+
+func addOpenAICompactSupportAttr(attrs map[string]string, supported *bool) {
+	if attrs == nil || supported == nil {
+		return
+	}
+	attrs["openai_compact_supported"] = strconv.FormatBool(*supported)
+}
+
+func addOpenAICompactModelMappingAttr(attrs map[string]string, mapping map[string]string) {
+	if attrs == nil || len(mapping) == 0 {
+		return
+	}
+	clean := make(map[string]string, len(mapping))
+	for from, to := range mapping {
+		from = strings.TrimSpace(from)
+		to = strings.TrimSpace(to)
+		if from == "" || to == "" {
+			continue
+		}
+		clean[from] = to
+	}
+	if len(clean) == 0 {
+		return
+	}
+	data, err := json.Marshal(clean)
+	if err != nil {
+		return
+	}
+	attrs["openai_compact_model_mapping"] = string(data)
 }

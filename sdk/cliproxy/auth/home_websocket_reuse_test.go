@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"testing"
@@ -9,6 +10,19 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+type groupScopedHomeDispatcher struct {
+	auth Auth
+}
+
+func (d groupScopedHomeDispatcher) HeartbeatOK() bool {
+	return true
+}
+
+func (d groupScopedHomeDispatcher) RPopAuth(context.Context, string, string, http.Header, int) ([]byte, error) {
+	raw, _ := json.Marshal(homeAuthDispatchResponse{Auth: d.auth})
+	return raw, nil
+}
 
 func TestPickNextViaHomeReusesPinnedWebsocketAuthWithoutHomeDispatch(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
@@ -53,6 +67,93 @@ func TestPickNextViaHomeReusesPinnedWebsocketAuthWithoutHomeDispatch(t *testing.
 	}
 	if provider != "test" {
 		t.Fatalf("pickNextViaHome() provider = %q, want test", provider)
+	}
+}
+
+func TestPickNextViaHomeDoesNotReusePinnedWebsocketAuthOutsideGroup(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		Home: internalconfig.HomeConfig{Enabled: true},
+		SDKConfig: internalconfig.SDKConfig{
+			Groups: []internalconfig.GroupConfig{
+				{Name: "team-b", Credentials: []string{"home-auth-b"}},
+			},
+		},
+	})
+	manager.RegisterExecutor(schedulerTestExecutor{})
+
+	manager.rememberHomeRuntimeAuth("session-1", &Auth{
+		ID:       "home-auth-a",
+		Provider: "test",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"websockets": "true",
+		},
+	})
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "session-1",
+			cliproxyexecutor.PinnedAuthMetadataKey:       "home-auth-a",
+			cliproxyexecutor.GroupNameMetadataKey:        "team-b",
+		},
+		Headers: http.Header{"Authorization": {"Bearer client-key-b"}},
+	}
+
+	got, executor, provider, errPick := manager.pickNextViaHome(ctx, "gpt-5.4", opts, nil)
+	if errPick == nil {
+		t.Fatal("pickNextViaHome() error is nil, want home unavailable after rejecting out-of-group cached auth")
+	}
+	var authErr *Error
+	if !errors.As(errPick, &authErr) || authErr.Code != "home_unavailable" {
+		t.Fatalf("pickNextViaHome() error = %v, want home_unavailable", errPick)
+	}
+	if got != nil || executor != nil || provider != "" {
+		t.Fatalf("pickNextViaHome() reused out-of-group auth: auth=%#v executor=%#v provider=%q", got, executor, provider)
+	}
+}
+
+func TestPickNextViaHomeRejectsDispatchedAuthOutsideGroup(t *testing.T) {
+	oldCurrentHomeDispatcher := currentHomeDispatcher
+	currentHomeDispatcher = func() homeAuthDispatcher {
+		return groupScopedHomeDispatcher{auth: Auth{
+			ID:       "home-auth-a",
+			Provider: "test",
+			Status:   StatusActive,
+		}}
+	}
+	t.Cleanup(func() {
+		currentHomeDispatcher = oldCurrentHomeDispatcher
+	})
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		Home: internalconfig.HomeConfig{Enabled: true},
+		SDKConfig: internalconfig.SDKConfig{
+			Groups: []internalconfig.GroupConfig{
+				{Name: "team-b", Credentials: []string{"home-auth-b"}},
+			},
+		},
+	})
+	manager.RegisterExecutor(schedulerTestExecutor{})
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.GroupNameMetadataKey: "team-b",
+		},
+	}
+
+	got, executor, provider, errPick := manager.pickNextViaHome(context.Background(), "gpt-5.4", opts, nil)
+	if errPick == nil {
+		t.Fatal("pickNextViaHome() error is nil, want out-of-group auth rejection")
+	}
+	var authErr *Error
+	if !errors.As(errPick, &authErr) || authErr.Code != "auth_not_found" {
+		t.Fatalf("pickNextViaHome() error = %v, want auth_not_found", errPick)
+	}
+	if got != nil || executor != nil || provider != "" {
+		t.Fatalf("pickNextViaHome() returned out-of-group dispatched auth: auth=%#v executor=%#v provider=%q", got, executor, provider)
 	}
 }
 

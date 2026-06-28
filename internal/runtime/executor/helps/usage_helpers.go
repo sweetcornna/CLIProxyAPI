@@ -482,6 +482,7 @@ func hasOpenAIStyleUsageTokenFields(usageNode gjson.Result) bool {
 		usageNode.Get("total_tokens").Exists() ||
 		usageNode.Get("prompt_tokens_details.cached_tokens").Exists() ||
 		usageNode.Get("input_tokens_details.cached_tokens").Exists() ||
+		usageNode.Get("cache_creation_input_tokens").Exists() ||
 		usageNode.Get("completion_tokens_details.reasoning_tokens").Exists() ||
 		usageNode.Get("output_tokens_details.reasoning_tokens").Exists()
 }
@@ -505,8 +506,11 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 		cached = usageNode.Get("input_tokens_details.cached_tokens")
 	}
 	if cached.Exists() {
-		detail.CachedTokens = cached.Int()
+		cacheReadTokens := cached.Int()
+		detail.CachedTokens = cacheReadTokens
+		detail.CacheReadTokens = cacheReadTokens
 	}
+	detail.CacheCreationTokens = usageNode.Get("cache_creation_input_tokens").Int()
 	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
 	if !reasoning.Exists() {
 		reasoning = usageNode.Get("output_tokens_details.reasoning_tokens")
@@ -544,6 +548,9 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	}
 	usageNode := gjson.GetBytes(payload, "usage")
 	if !usageNode.Exists() {
+		usageNode = gjson.GetBytes(payload, "message.usage")
+	}
+	if !usageNode.Exists() {
 		return usage.Detail{}, false
 	}
 	return parseClaudeUsageNode(usageNode), true
@@ -551,6 +558,9 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 
 func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 	cacheReadTokens := usageNode.Get("cache_read_input_tokens").Int()
+	if cacheReadTokens == 0 {
+		cacheReadTokens = usageNode.Get("cached_tokens").Int()
+	}
 	cacheCreationTokens := usageNode.Get("cache_creation_input_tokens").Int()
 	detail := usage.Detail{
 		InputTokens:         usageNode.Get("input_tokens").Int(),
@@ -566,13 +576,62 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 	return detail
 }
 
+type ClaudeStreamUsageAccumulator struct {
+	detail usage.Detail
+	seen   bool
+}
+
+func (a *ClaudeStreamUsageAccumulator) Add(detail usage.Detail) {
+	if a == nil || !hasNonZeroTokenUsage(detail) {
+		return
+	}
+	a.seen = true
+	if detail.InputTokens != 0 {
+		a.detail.InputTokens = detail.InputTokens
+	}
+	if detail.OutputTokens != 0 {
+		a.detail.OutputTokens = detail.OutputTokens
+	}
+	if detail.ReasoningTokens != 0 {
+		a.detail.ReasoningTokens = detail.ReasoningTokens
+	}
+	if detail.CacheReadTokens != 0 {
+		a.detail.CacheReadTokens = detail.CacheReadTokens
+	}
+	if detail.CacheCreationTokens != 0 {
+		a.detail.CacheCreationTokens = detail.CacheCreationTokens
+	}
+	if detail.CachedTokens != 0 {
+		a.detail.CachedTokens = detail.CachedTokens
+	}
+	a.detail.TotalTokens = a.detail.InputTokens + a.detail.OutputTokens + a.detail.CacheReadTokens + a.detail.CacheCreationTokens
+}
+
+func (a *ClaudeStreamUsageAccumulator) Detail() (usage.Detail, bool) {
+	if a == nil || !a.seen {
+		return usage.Detail{}, false
+	}
+	detail := a.detail
+	if detail.CachedTokens == 0 {
+		if detail.CacheReadTokens != 0 {
+			detail.CachedTokens = detail.CacheReadTokens
+		} else {
+			detail.CachedTokens = detail.CacheCreationTokens
+		}
+	}
+	detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.CacheReadTokens + detail.CacheCreationTokens
+	return detail, true
+}
+
 func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
+	cacheReadTokens := node.Get("cachedContentTokenCount").Int()
 	detail := usage.Detail{
 		InputTokens:     node.Get("promptTokenCount").Int(),
 		OutputTokens:    node.Get("candidatesTokenCount").Int(),
 		ReasoningTokens: node.Get("thoughtsTokenCount").Int(),
 		TotalTokens:     node.Get("totalTokenCount").Int(),
-		CachedTokens:    node.Get("cachedContentTokenCount").Int(),
+		CachedTokens:    cacheReadTokens,
+		CacheReadTokens: cacheReadTokens,
 	}
 	if detail.TotalTokens == 0 {
 		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens

@@ -246,10 +246,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
 
-	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
-		body = ensureCacheControl(body)
-	}
+	// Ensure each independent cache hierarchy has an anchor. Section helpers
+	// preserve existing client cache_control blocks while still adding missing
+	// tools/system anchors when messages already contain cache_control.
+	body = ensureCacheControl(body)
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	// Cloaking and ensureCacheControl may push the total over 4 when the client
@@ -263,6 +263,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// Extract betas from body and convert to header
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
+	body, extraBetas = applyClaudeCodeMessagesCompaction(ctx, body, baseModel, extraBetas)
 	bodyForTranslation := body
 	bodyForUpstream := body
 	oauthToken := isClaudeOAuthToken(apiKey)
@@ -283,6 +284,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
+	applyClaudeCodeSessionHeader(httpReq, ctx, req.Payload)
 	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg); errHeaders != nil {
 		return resp, errHeaders
 	}
@@ -362,11 +364,15 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			helps.RecordAPIResponseError(ctx, e.cfg, errValidate)
 			return resp, errValidate
 		}
+		var streamUsage helps.ClaudeStreamUsageAccumulator
 		lines := bytes.Split(data, []byte("\n"))
 		for _, line := range lines {
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+				streamUsage.Add(detail)
 			}
+		}
+		if detail, ok := streamUsage.Detail(); ok {
+			reporter.Publish(ctx, detail)
 		}
 	} else {
 		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
@@ -436,10 +442,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
 
-	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
-		body = ensureCacheControl(body)
-	}
+	// Ensure each independent cache hierarchy has an anchor. Section helpers
+	// preserve existing client cache_control blocks while still adding missing
+	// tools/system anchors when messages already contain cache_control.
+	body = ensureCacheControl(body)
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	body = enforceCacheControlLimit(body, 4)
@@ -450,6 +456,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Extract betas from body and convert to header
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
+	body, extraBetas = applyClaudeCodeMessagesCompaction(ctx, body, baseModel, extraBetas)
 	bodyForTranslation := body
 	bodyForUpstream := body
 	oauthToken := isClaudeOAuthToken(apiKey)
@@ -469,6 +476,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
+	applyClaudeCodeSessionHeader(httpReq, ctx, req.Payload)
 	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg); errHeaders != nil {
 		return nil, errHeaders
 	}
@@ -546,11 +554,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			sawMessageStop := false
+			var streamUsage helps.ClaudeStreamUsageAccumulator
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
+					streamUsage.Add(detail)
 				}
 				if bytes.Contains(line, []byte("message_stop")) {
 					sawMessageStop = true
@@ -567,13 +576,22 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 			}
 			if errScan := scanner.Err(); errScan != nil {
+				if detail, ok := streamUsage.Detail(); ok {
+					reporter.Publish(ctx, detail)
+				}
+				errScan = normalizeStreamReadError("claude", errScan)
 				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 				reporter.PublishFailure(ctx, errScan)
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 				case <-ctx.Done():
 				}
-			} else if !sawMessageStop {
+			} else {
+				if detail, ok := streamUsage.Detail(); ok {
+					reporter.Publish(ctx, detail)
+				}
+			}
+			if scanner.Err() == nil && !sawMessageStop {
 				// The upstream closed the SSE stream cleanly without emitting a
 				// terminal message_stop event. Synthesize one so downstream
 				// clients receive a proper stream terminator instead of
@@ -595,11 +613,12 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		sawMessageStop := false
+		var streamUsage helps.ClaudeStreamUsageAccumulator
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
+				streamUsage.Add(detail)
 			}
 			if bytes.Contains(line, []byte("message_stop")) {
 				sawMessageStop = true
@@ -624,13 +643,22 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
+			if detail, ok := streamUsage.Detail(); ok {
+				reporter.Publish(ctx, detail)
+			}
+			errScan = normalizeStreamReadError("claude", errScan)
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
 			}
-		} else if !sawMessageStop {
+		} else {
+			if detail, ok := streamUsage.Detail(); ok {
+				reporter.Publish(ctx, detail)
+			}
+		}
+		if scanner.Err() == nil && !sawMessageStop {
 			// The upstream closed the stream cleanly without a terminal
 			// message_stop. Feed a synthetic Claude message_stop event through
 			// the translator so it can finalize the downstream stream (e.g.
@@ -757,6 +785,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	applyClaudeCodeSessionHeader(httpReq, ctx, req.Payload)
 	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg); errHeaders != nil {
 		return cliproxyexecutor.Response{}, errHeaders
 	}
@@ -889,6 +918,91 @@ func extractAndRemoveBetas(body []byte) ([]string, []byte) {
 	}
 	body, _ = sjson.DeleteBytes(body, "betas")
 	return betas, body
+}
+
+const (
+	claudeMessagesCompactionBetaToken = "compact-2026-01-12"
+	claudeMessagesCompactionEditType  = "compact_20260112"
+)
+
+func applyClaudeCodeMessagesCompaction(ctx context.Context, body []byte, baseModel string, extraBetas []string) ([]byte, []string) {
+	if !isClaudeCodeMessagesRequest(ctx) || !claudeMessagesCompactionSupportedModel(baseModel) {
+		return body, extraBetas
+	}
+	body = ensureClaudeMessagesCompactionEdit(body)
+	extraBetas = appendBetaTokenOnce(extraBetas, claudeMessagesCompactionBetaToken)
+	return body, extraBetas
+}
+
+func isClaudeCodeMessagesRequest(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return false
+	}
+	headers := ginCtx.Request.Header
+	userAgent := strings.ToLower(strings.TrimSpace(headers.Get("User-Agent")))
+	xApp := strings.ToLower(strings.TrimSpace(headers.Get("X-App")))
+	beta := strings.ToLower(strings.TrimSpace(headers.Get("Anthropic-Beta")))
+	return strings.HasPrefix(userAgent, "claude-cli/") ||
+		xApp == "claude-code" ||
+		strings.Contains(beta, "claude-code-20250219")
+}
+
+func claudeMessagesCompactionSupportedModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if model == "" {
+		return false
+	}
+	for _, prefix := range []string{
+		"claude-fable-5",
+		"claude-mythos",
+		"claude-opus-4-6",
+		"claude-opus-4-7",
+		"claude-opus-4-8",
+		"claude-sonnet-4-6",
+	} {
+		if strings.HasPrefix(model, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureClaudeMessagesCompactionEdit(body []byte) []byte {
+	edits := gjson.GetBytes(body, "context_management.edits")
+	if edits.IsArray() {
+		for _, edit := range edits.Array() {
+			if edit.Get("type").String() == claudeMessagesCompactionEditType {
+				return body
+			}
+		}
+		updated, err := sjson.SetRawBytes(body, "context_management.edits.-1", []byte(`{"type":"`+claudeMessagesCompactionEditType+`"}`))
+		if err == nil {
+			return updated
+		}
+		return body
+	}
+	updated, err := sjson.SetRawBytes(body, "context_management.edits", []byte(`[{"type":"`+claudeMessagesCompactionEditType+`"}]`))
+	if err != nil {
+		return body
+	}
+	return updated
+}
+
+func appendBetaTokenOnce(tokens []string, token string) []string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return tokens
+	}
+	for _, existing := range tokens {
+		if strings.EqualFold(strings.TrimSpace(existing), token) {
+			return tokens
+		}
+	}
+	return append(tokens, token)
 }
 
 // disableThinkingIfToolChoiceForced checks if tool_choice forces tool use and disables thinking.
@@ -1180,6 +1294,15 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		r.Header.Set("Accept-Encoding", "identity")
 	}
 	return nil
+}
+
+func applyClaudeCodeSessionHeader(r *http.Request, ctx context.Context, payload []byte) {
+	if r == nil || strings.TrimSpace(r.Header.Get(helps.ClaudeCodeSessionHeader)) != "" {
+		return
+	}
+	if sessionID := helps.ExtractClaudeCodeSessionID(ctx, payload, nil); sessionID != "" {
+		r.Header.Set(helps.ClaudeCodeSessionHeader, sessionID)
+	}
 }
 
 func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
