@@ -68,6 +68,19 @@ var (
 	newCodexOAuthService  = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
 )
 
+type authFileGroupValidationError struct {
+	message string
+}
+
+func (e authFileGroupValidationError) Error() string {
+	return e.message
+}
+
+func isAuthFileGroupValidationError(err error) bool {
+	var target authFileGroupValidationError
+	return errors.As(err, &target)
+}
+
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
 		return time.Time{}, false
@@ -745,10 +758,19 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errMultipart)})
 		return
 	}
+	allowedGroups, errGroups := authFileAllowedGroupsFromRequest(c)
+	if errGroups != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errGroups.Error()})
+		return
+	}
 	if len(fileHeaders) == 1 {
-		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
+		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0], allowedGroups); errUpload != nil {
 			if errors.Is(errUpload, errAuthFileMustBeJSON) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
+				return
+			}
+			if isAuthFileGroupValidationError(errUpload) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errUpload.Error()})
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
@@ -761,7 +783,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		uploaded := make([]string, 0, len(fileHeaders))
 		failed := make([]gin.H, 0)
 		for _, file := range fileHeaders {
-			name, errUpload := h.storeUploadedAuthFile(ctx, file)
+			name, errUpload := h.storeUploadedAuthFile(ctx, file, allowedGroups)
 			if errUpload != nil {
 				failureName := ""
 				if file != nil {
@@ -806,7 +828,11 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
-	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
+	if err = h.writeAuthFile(ctx, filepath.Base(name), data, allowedGroups); err != nil {
+		if isAuthFileGroupValidationError(err) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -919,7 +945,7 @@ func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHea
 	return headers, nil
 }
 
-func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader) (string, error) {
+func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader, allowedGroups []string) (string, error) {
 	if file == nil {
 		return "", fmt.Errorf("no file uploaded")
 	}
@@ -937,13 +963,13 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 	if err != nil {
 		return "", fmt.Errorf("failed to read uploaded file: %w", err)
 	}
-	if err := h.writeAuthFile(ctx, name, data); err != nil {
+	if err := h.writeAuthFile(ctx, name, data, allowedGroups); err != nil {
 		return "", err
 	}
 	return name, nil
 }
 
-func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte, allowedGroups []string) error {
 	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	if !filepath.IsAbs(dst) {
 		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
@@ -954,11 +980,35 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if err != nil {
 		return err
 	}
+	nextCfg, cfgChanged, errGroups := h.nextConfigWithAuthFileGroupBindings(dst, auth, allowedGroups)
+	if errGroups != nil {
+		return errGroups
+	}
+
+	var oldData []byte
+	hadOldFile := false
+	if existingData, errRead := os.ReadFile(dst); errRead == nil {
+		oldData = existingData
+		hadOldFile = true
+	}
+	var oldAuth *coreauth.Auth
+	if h.authManager != nil {
+		if existingAuth, ok := h.authManager.GetByID(auth.ID); ok && existingAuth != nil {
+			oldAuth = existingAuth.Clone()
+		}
+	}
 	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
+		h.rollbackAuthFileWrite(ctx, dst, hadOldFile, oldData, oldAuth, auth.ID)
 		return err
+	}
+	if cfgChanged {
+		if errSave := h.saveAuthFileGroupConfig(ctx, nextCfg); errSave != nil {
+			h.rollbackAuthFileWrite(ctx, dst, hadOldFile, oldData, oldAuth, auth.ID)
+			return errSave
+		}
 	}
 	return nil
 }
